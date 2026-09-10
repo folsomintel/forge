@@ -57,29 +57,22 @@ webhooks) and a Server-Sent Events stream of ref updates.
 
 See `ARCHITECTURE.md` for the full design.
 
-## Reimplemented for object storage
+## Git on object storage
 
-Most git servers shell out to `git` for everything. Forge keeps stock git only
-where protocol fidelity is hard-won — pack generation, repacking, and as a
-correctness fallback — and reimplements the request hot paths in Go so they fit
-an object store instead of a local disk:
+Forge implements common Git operations in Go to avoid starting a Git process
+for each request and to read packs directly from the bucket.
 
-- **Ref advertisement** — served straight from the index, with no fork and no
-  repo materialization on `info/refs` (the request every clone, fetch, and push
-  begins with).
-- **Receive (push)** — native packfile parsing with delta and thin-pack
-  resolution, so a push is ingested without forking `git`.
-- **Fetch / clone** — incremental packs assembled from recorded pushes, and a
-  whole-repo clone streamed directly from the bucket.
-- **Object reads** — Go tree/commit parsers over a pooled `cat-file`, plus a
-  random-access pack reader that resolves objects (deltas included) from pack
-  data paged out of the bucket in blocks — so a replica can serve a repo whose
-  packs never touch its disk.
+- Ref advertisements (`info/refs`) read from the metadata index without loading
+  the repository into the local cache.
+- Pushes use a Go packfile parser that resolves deltas and thin packs.
+- Fetches assemble incremental packs from previous pushes. Full clones can
+  stream packs directly from the bucket.
+- Object reads use Go tree and commit parsers with a pool of `git cat-file`
+  processes. On replicas, a pack reader can fetch blocks from the bucket and
+  resolve objects, including deltas, without downloading entire packs to disk.
 
-The result: no fork-per-request under load, and reads served against packs that
-live in object storage. What forge deliberately does **not** reinvent is
-protocol negotiation or pack generation — those stay on git, and every Go path
-falls back to it.
+Git still handles pack generation and repacking. Requests the Go paths cannot
+handle fall back to Git.
 
 ## Configuration
 
