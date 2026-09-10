@@ -52,8 +52,10 @@ func TestSameRepoParallelPushStorm(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Let the trailing nudged maintenance run settle before inspecting the
-	// store (its blob deletes race the assertion otherwise).
-	waitFor(t, "maintenance quiescence", 15*time.Second, func() bool {
+	// store (its blob deletes race the assertion otherwise). Generous timeout:
+	// consolidation of a parallel-push storm is CPU-bound and slow on loaded
+	// shared CI runners.
+	waitFor(t, "maintenance quiescence", 60*time.Second, func() bool {
 		a, _ := e.srv.DB.ListPacks(t.Context(), "demo")
 		time.Sleep(400 * time.Millisecond)
 		b, _ := e.srv.DB.ListPacks(t.Context(), "demo")
