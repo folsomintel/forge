@@ -35,7 +35,7 @@ func storm(args []string) error {
 	direct := fs.Bool("direct", false, "skip the info/refs advertisement round trip")
 	keep := fs.Bool("keep", false, "keep storm-* repos afterwards")
 	apiReads := fs.Bool("api-reads", false, "REST read storm (contents+commits) instead of pushes")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *baseURL == "" || *tok == "" {
 		return fmt.Errorf("--url and --token are required")
 	}
@@ -66,7 +66,9 @@ func storm(args []string) error {
 			return nil, fmt.Errorf("%s %s: %d %s", method, path, res.StatusCode, string(data))
 		}
 		out := map[string]any{}
-		json.Unmarshal(data, &out)
+		if err := json.Unmarshal(data, &out); err != nil {
+			return nil, err
+		}
 		return out, nil
 	}
 
@@ -140,7 +142,7 @@ func storm(args []string) error {
 
 	if !*keep {
 		for i := 0; i < *repos; i++ {
-			apiJSON("DELETE", fmt.Sprintf("/api/repos/storm-%d", i), "")
+			_, _ = apiJSON("DELETE", fmt.Sprintf("/api/repos/storm-%d", i), "")
 		}
 	}
 	return nil
@@ -163,7 +165,7 @@ func apiReadStorm(client *http.Client, base, tok string, writers, reads, repos i
 		if err != nil {
 			return 0, err
 		}
-		io.Copy(io.Discard, res.Body)
+		_, _ = io.Copy(io.Discard, res.Body)
 		res.Body.Close()
 		return res.StatusCode, nil
 	}
@@ -226,7 +228,7 @@ func apiReadStorm(client *http.Client, base, tok string, writers, reads, repos i
 	fmt.Printf("wal         (api reads)\n")
 	if !keep {
 		for i := 0; i < repos; i++ {
-			apiJSON("DELETE", fmt.Sprintf("/api/repos/storm-%d", i), "")
+			_, _ = apiJSON("DELETE", fmt.Sprintf("/api/repos/storm-%d", i), "")
 		}
 	}
 	return nil
@@ -262,7 +264,7 @@ func pushOnce(client *http.Client, base, tok, repo, branch string, direct bool) 
 		if err != nil {
 			return err
 		}
-		io.Copy(io.Discard, res.Body)
+		_, _ = io.Copy(io.Discard, res.Body)
 		res.Body.Close()
 		if res.StatusCode != 200 {
 			return fmt.Errorf("info/refs: %d", res.StatusCode)

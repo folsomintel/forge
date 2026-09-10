@@ -194,7 +194,7 @@ func (w *WAL) repo(repoID string) *walRepo {
 
 func walKey(seq int64) string { return fmt.Sprintf("%s%016d.json", walPrefix, seq) }
 
-// UpdateRefs: CAS against the index, conditional-PUT the WAL entry (the
+// UpdateRefs CAS against the index, conditional-PUT the WAL entry (the
 // real arbiter), apply to the index. Group commit: concurrent callers on
 // one repo queue behind a leader that lands the whole batch as ONE
 // conditional PUT - the entry format is unchanged (just more updates per

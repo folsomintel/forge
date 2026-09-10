@@ -16,7 +16,7 @@ func token(args []string) error {
 	repo := fs.String("repo", "", "restrict token to one repo id")
 	ttl := fs.Duration("ttl", time.Hour, "token lifetime")
 	sub := fs.String("sub", "cli", "subject claim")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	if *keyPath == "" {
 		return fmt.Errorf("--key is required")

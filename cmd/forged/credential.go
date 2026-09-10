@@ -32,7 +32,7 @@ func credential(args []string) error {
 	scopes := fs.String("scopes", "git:read git:write repo:write org:read", "space-separated scopes")
 	ttl := fs.Duration("ttl", 5*time.Minute, "token lifetime (kept short since it is minted per operation)")
 	sub := fs.String("sub", "git", "subject claim")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	op := "get"
 	if fs.NArg() > 0 {

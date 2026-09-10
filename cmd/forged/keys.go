@@ -25,7 +25,7 @@ import (
 func keygen(args []string) error {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	name := fs.String("name", "default", "key name")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	cfg := config.FromEnv()
 	db, _, err := server.OpenStores(cfg)
@@ -63,7 +63,7 @@ func addkey(args []string) error {
 	name := fs.String("name", "default", "key name")
 	pemB64 := fs.String("pem-b64", "", "base64-encoded public key PEM")
 	scopeStr := fs.String("scopes", "", "space-separated SSH scopes (default: full access)")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *pemB64 == "" {
 		return fmt.Errorf("--pem-b64 is required")
 	}
@@ -84,9 +84,11 @@ func addkey(args []string) error {
 	if err != nil {
 		return err
 	}
-	db.AddAudit(context.Background(), repodb.AuditEntry{
+	if err := db.AddAudit(context.Background(), repodb.AuditEntry{
 		Actor: "operator", Action: "key.add", Target: *name,
-	})
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: audit log failed:", err)
+	}
 	fmt.Printf("registered key %d (%s)\n", id, *name)
 	return nil
 }
@@ -96,7 +98,7 @@ func addkey(args []string) error {
 func delkey(args []string) error {
 	fs := flag.NewFlagSet("delkey", flag.ExitOnError)
 	id := fs.Int64("id", 0, "key id to revoke")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 	if *id == 0 {
 		return fmt.Errorf("--id is required")
 	}
@@ -113,9 +115,11 @@ func delkey(args []string) error {
 	if !existed {
 		return fmt.Errorf("no key with id %d", *id)
 	}
-	db.AddAudit(context.Background(), repodb.AuditEntry{
+	if err := db.AddAudit(context.Background(), repodb.AuditEntry{
 		Actor: "operator", Action: "key.delete", Target: fmt.Sprintf("%d", *id),
-	})
+	}); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: audit log failed:", err)
+	}
 	fmt.Printf("revoked key %d\n", *id)
 	return nil
 }

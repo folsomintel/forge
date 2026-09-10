@@ -173,7 +173,7 @@ func (h *Handler) lfsDownload(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", obj.Size))
-	io.Copy(w, rc)
+	_, _ = io.Copy(w, rc)
 }
 
 // lfsUpload streams the (size-bounded) body into a private temp key while
@@ -193,18 +193,18 @@ func (h *Handler) lfsUpload(w http.ResponseWriter, r *http.Request) {
 	body := http.MaxBytesReader(w, r.Body, lfsMaxUploadBytes)
 	counter := &countReader{r: io.TeeReader(body, hasher)}
 	if err := h.Blobs.Put(r.Context(), repo, tmpKey, counter); err != nil {
-		h.Blobs.Delete(r.Context(), repo, tmpKey)
+		_ = h.Blobs.Delete(r.Context(), repo, tmpKey)
 		slog.Error("lfs upload", "repo", repo, "oid", oid, "err", err)
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return
 	}
 	if hex.EncodeToString(hasher.Sum(nil)) != oid {
-		h.Blobs.Delete(r.Context(), repo, tmpKey)
+		_ = h.Blobs.Delete(r.Context(), repo, tmpKey)
 		http.Error(w, "content does not match oid", http.StatusBadRequest)
 		return
 	}
 	if err := h.Blobs.Copy(r.Context(), repo, tmpKey, "lfs/"+oid); err != nil {
-		h.Blobs.Delete(r.Context(), repo, tmpKey)
+		_ = h.Blobs.Delete(r.Context(), repo, tmpKey)
 		slog.Error("lfs promote", "repo", repo, "oid", oid, "err", err)
 		http.Error(w, "storage error", http.StatusInternalServerError)
 		return

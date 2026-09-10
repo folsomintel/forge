@@ -259,7 +259,7 @@ func (s *SQLite) DeleteRepo(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	res, err := tx.ExecContext(ctx, `DELETE FROM repos WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -338,7 +338,7 @@ func (s *SQLite) ReplacePacks(ctx context.Context, repoID string, oldNames []str
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, name := range oldNames {
 		res, err := tx.ExecContext(ctx, `DELETE FROM packs WHERE repo_id = ? AND name = ?`, repoID, name)
 		if err != nil {
@@ -435,7 +435,7 @@ func (s *SQLite) AddPacks(ctx context.Context, repoID string, packs []Pack) erro
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, p := range packs {
 		// Idempotent: re-pushing identical objects can produce the same pack name.
 		if _, err := tx.ExecContext(ctx,
@@ -507,7 +507,7 @@ func (s *SQLite) ForkRepo(ctx context.Context, srcID, dstID string) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var branch string
 	if err := tx.QueryRowContext(ctx,
 		`SELECT default_branch FROM repos WHERE id = ?`, srcID).Scan(&branch); err != nil {
@@ -622,7 +622,7 @@ func (s *SQLite) ApplyWAL(ctx context.Context, repoID string, updates []RefUpdat
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	for _, p := range packs {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO packs (repo_id, name, size_bytes, source, created_at) VALUES (?, ?, ?, ?, ?)
@@ -689,7 +689,7 @@ func (s *SQLite) ApplySnapshot(ctx context.Context, repoID string, refs []Ref, s
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `DELETE FROM refs WHERE repo_id = ?`, repoID); err != nil {
 		return err
 	}

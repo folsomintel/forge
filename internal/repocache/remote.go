@@ -23,7 +23,7 @@ const remoteSidecarExt = ".remote"
 // writeRemoteSidecar records a remotely-served pack's size next to its .idx,
 // so the serving path knows the blob size without a DB or store round trip.
 func (c *Cache) writeRemoteSidecar(packDir string, p repodb.Pack) {
-	WriteFileAtomic(filepath.Join(packDir, p.Name+remoteSidecarExt), []byte(strconv.FormatInt(p.SizeBytes, 10)))
+	_ = WriteFileAtomic(filepath.Join(packDir, p.Name+remoteSidecarExt), []byte(strconv.FormatInt(p.SizeBytes, 10)))
 }
 
 // hydrateIdxOnly fetches just the .idx of each remote pack (concurrently) and

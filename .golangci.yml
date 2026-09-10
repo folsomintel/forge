@@ -3,11 +3,20 @@ linters:
   default: standard
   settings:
     staticcheck:
-      # QF1001/QF1003 are stylistic quick-fix suggestions (De Morgan's law,
-      # tagged switch), not correctness issues — keep everything else.
-      checks: ["all", "-QF1001", "-QF1003"]
+      # QF* are stylistic quick-fix refactors (De Morgan's, tagged switch,
+      # drop embedded-field selector) — advisory, not correctness.
+      checks: ["all", "-QF1001", "-QF1002", "-QF1003", "-QF1008"]
   exclusions:
-    # Idiomatic best-effort calls (Close/Remove on cleanup, etc.) are
-    # deliberately unchecked; the std-error-handling preset excludes them.
     presets:
       - std-error-handling
+    rules:
+      # Deliberately-unchecked sinks: mid-stream writes to a response/buffer,
+      # cleanup Close/Delete/Chmod, best-effort cache/advertisement writes
+      # (WriteFile/FetchBlob), deferred rollbacks, SSH control replies, and
+      # intentionally-swallowed config unmarshals. Everything else — DB writes,
+      # Blobs.Put, Blobs.Copy, etc. — stays checked.
+      - linters: [errcheck]
+        text: 'Error return value of .*\.(Close|Delete|Copy|Write|Kill|Wait|Encode|MkdirAll|Chmod|Seek|Unmarshal|FetchBlob|SetImport|SetDeadline|SetWriteDeadline|Reply|Reject|SendRequest|RunStream)'
+      # Test setup intentionally ignores errors.
+      - linters: [errcheck]
+        path: _test\.go

@@ -71,7 +71,7 @@ func HostAllowed(host string) bool {
 	return true
 }
 
-// Dialer's guard runs in Control - after DNS resolution, on the literal
+// Dialer builds a net.Dialer whose guard runs in Control - after DNS resolution, on the literal
 // address, re-checked on every redirect hop. Hostnames are additionally
 // screened pre-DNS.
 func Dialer(allowPrivate bool) *net.Dialer {

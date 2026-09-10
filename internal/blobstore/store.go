@@ -1,4 +1,4 @@
-// Package store is the pack store: immutable blobs (pack + idx files) keyed
+// Package blobstore is the pack store: immutable blobs (pack + idx files) keyed
 // by repo and filename. Blobs are written once and never modified - deletes
 // only happen during compaction, after the metadata pack list has moved on.
 package blobstore
