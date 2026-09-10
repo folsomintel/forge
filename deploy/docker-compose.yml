@@ -1,0 +1,63 @@
+# One-tenant deployment. Durability is the bucket itself: packs and the
+# ref WAL live there, so the data volume is a disposable cache and a fresh
+# machine self-recovers from the bucket on boot.
+#
+#   cp deploy/.env.example deploy/.env   # fill in your bucket
+#   docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d
+#
+# BYO-bucket: point FORGE_S3_* at your own S3/R2/GCS bucket and delete the
+# minio service (or keep it for local evaluation with `--profile local-s3`).
+
+services:
+  forged:
+    build: ..
+    restart: unless-stopped
+    ports:
+      - "8347:8347"
+    environment:
+      FORGE_STORE: s3
+      FORGE_S3_ENDPOINT: ${FORGE_S3_ENDPOINT}
+      FORGE_S3_BUCKET: ${FORGE_S3_BUCKET}
+      FORGE_S3_ACCESS_KEY: ${FORGE_S3_ACCESS_KEY}
+      FORGE_S3_SECRET_KEY: ${FORGE_S3_SECRET_KEY}
+      FORGE_S3_USE_SSL: ${FORGE_S3_USE_SSL:-true}
+      # Route webhook egress through a CONNECT proxy (e.g. Smokescreen):
+      # FORGE_EGRESS_PROXY: http://smokescreen:4750
+    volumes:
+      - forge-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8347/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Local S3 for evaluation only: docker compose --profile local-s3 up
+  minio:
+    image: minio/minio:latest
+    profiles: ["local-s3"]
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${FORGE_S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${FORGE_S3_SECRET_KEY}
+    ports:
+      - "9000:9000"
+    volumes:
+      - minio-data:/data
+
+  # Creates the bucket on first run (local evaluation only).
+  minio-init:
+    image: minio/mc:latest
+    profiles: ["local-s3"]
+    depends_on:
+      - minio
+    environment:
+      MINIO_USER: ${FORGE_S3_ACCESS_KEY}
+      MINIO_PASS: ${FORGE_S3_SECRET_KEY}
+      BUCKET: ${FORGE_S3_BUCKET}
+    entrypoint: /bin/sh
+    command: -c 'until mc alias set local http://minio:9000 "$$MINIO_USER" "$$MINIO_PASS" >/dev/null 2>&1; do sleep 1; done; mc mb -p "local/$$BUCKET"'
+
+volumes:
+  forge-data:
+  minio-data:

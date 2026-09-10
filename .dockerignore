@@ -1,0 +1,9 @@
+.git
+dist/
+forged
+data/
+*.db
+*.db-*
+.env
+node_modules
+*.tsbuildinfo

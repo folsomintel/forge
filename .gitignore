@@ -1,0 +1,14 @@
+# Build output
+/forged
+/forged-*
+/dist/
+
+# Local runtime state
+/data/
+*.db
+*.db-*
+.env
+
+# Go / editor
+*.tsbuildinfo
+.DS_Store
