@@ -113,11 +113,8 @@ func (s *Server) streamEvents(hc huma.Context, repoID string, after int64) {
 	defer cancel()
 
 	lastSent := int64(-1)
-	if repoID != "" && after >= 0 {
-		src, ok := s.DB.(refEventSource)
-		if !ok {
-			after = -1
-		} else {
+	if src, ok := s.DB.(refEventSource); ok && repoID != "" && after >= 0 {
+		{
 			updates, seqs, ts, complete, err := src.ReplayRefEvents(hc.Context(), repoID, after)
 			if err != nil || !complete {
 				// The missed tail is gone (pruned) or unreadable: tell the

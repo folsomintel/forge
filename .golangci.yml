@@ -1,4 +1,13 @@
 version: "2"
 linters:
   default: standard
-  # add: [revive, misspell] once the tree is clean under them
+  settings:
+    staticcheck:
+      # QF1001/QF1003 are stylistic quick-fix suggestions (De Morgan's law,
+      # tagged switch), not correctness issues — keep everything else.
+      checks: ["all", "-QF1001", "-QF1003"]
+  exclusions:
+    # Idiomatic best-effort calls (Close/Remove on cleanup, etc.) are
+    # deliberately unchecked; the std-error-handling preset excludes them.
+    presets:
+      - std-error-handling

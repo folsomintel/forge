@@ -151,7 +151,7 @@ func storm(args []string) error {
 func apiReadStorm(client *http.Client, base, tok string, writers, reads, repos int, keep bool, apiJSON func(string, string, string) (map[string]any, error)) error {
 	// Seed each repo with one commit so reads have content.
 	for i := 0; i < repos; i++ {
-		body := fmt.Sprintf(`{"message":"seed","content":"c2VlZAo=","branch":"main"}`)
+		body := `{"message":"seed","content":"c2VlZAo=","branch":"main"}`
 		if _, err := apiJSON("PUT", fmt.Sprintf("/api/repos/storm-%d/contents/seed.txt", i), body); err != nil {
 			return fmt.Errorf("seed storm-%d: %w", i, err)
 		}

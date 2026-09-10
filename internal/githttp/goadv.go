@@ -41,7 +41,6 @@ type advCaps struct {
 	uploadV0  string   // upload-pack v0 capability string (sans agent/symref)
 	receiveV0 string   // receive-pack capability string (sans agent)
 	uploadV2  []string // v2 capability lines (sans agent)
-	err       error
 }
 
 var (
