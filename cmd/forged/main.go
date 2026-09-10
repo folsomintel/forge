@@ -3,7 +3,7 @@
 //	forged serve              - run the server
 //	forged keygen --name X    - generate a client keypair, register the public key
 //	forged addkey --pem-b64 P - register an existing client public key
-//	forged token --key K ...  - mint a test JWT (customers self-sign in prod)
+//	forged token --key K ...  - mint a test JWT (clients self-sign in production)
 //	forged openapi            - print the generated OpenAPI spec
 //	forged hook pre-receive   - internal: invoked by git during pushes
 package main

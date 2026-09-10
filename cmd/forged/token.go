@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// token mints a JWT for local testing. In production, customers sign their
+// token mints a JWT for local testing. In production, clients sign their
 // own with the private key from keygen (or use `forged credential` as a git
 // helper so a fresh token is minted per operation).
 func token(args []string) error {

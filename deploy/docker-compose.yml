@@ -1,4 +1,4 @@
-# One-tenant deployment. Durability is the bucket itself: packs and the
+# Single-instance deployment. Durability is the bucket itself: packs and the
 # ref WAL live there, so the data volume is a disposable cache and a fresh
 # machine self-recovers from the bucket on boot.
 #

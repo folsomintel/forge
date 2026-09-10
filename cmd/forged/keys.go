@@ -21,7 +21,7 @@ import (
 
 // keygen creates an ECDSA P-256 keypair, registers the public key in the
 // metadata DB, and prints the private key PEM to stdout (shown once, never
-// stored - the customer keeps it and self-signs tokens).
+// stored - the holder keeps it and self-signs tokens).
 func keygen(args []string) error {
 	fs := flag.NewFlagSet("keygen", flag.ExitOnError)
 	name := fs.String("name", "default", "key name")
@@ -57,7 +57,7 @@ func keygen(args []string) error {
 }
 
 // addkey registers an existing client public key (PEM, base64-encoded so it
-// survives argv). Used by the control plane to seed a fresh tenant machine.
+// survives argv). Non-interactive: for seeding a key at provisioning time.
 func addkey(args []string) error {
 	fs := flag.NewFlagSet("addkey", flag.ExitOnError)
 	name := fs.String("name", "default", "key name")
@@ -93,8 +93,8 @@ func addkey(args []string) error {
 	return nil
 }
 
-// delkey revokes a registered key by id. Used by the control plane to
-// retire a compromised or stale credential from a tenant machine.
+// delkey revokes a registered key by id — retire a compromised or stale
+// credential.
 func delkey(args []string) error {
 	fs := flag.NewFlagSet("delkey", flag.ExitOnError)
 	id := fs.Int64("id", 0, "key id to revoke")

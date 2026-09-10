@@ -55,7 +55,31 @@ webhooks) and a Server-Sent Events stream of ref updates.
   replica can serve a repo larger than its disk: it keeps pack indexes local
   and reads pack data from the bucket in blocks.
 
-See `ARCHITECTURE.md` for the design and `docs/` for the reasoning behind it.
+See `ARCHITECTURE.md` for the full design.
+
+## Reimplemented for object storage
+
+Most git servers shell out to `git` for everything. Forge keeps stock git only
+where protocol fidelity is hard-won — pack generation, repacking, and as a
+correctness fallback — and reimplements the request hot paths in Go so they fit
+an object store instead of a local disk:
+
+- **Ref advertisement** — served straight from the index, with no fork and no
+  repo materialization on `info/refs` (the request every clone, fetch, and push
+  begins with).
+- **Receive (push)** — native packfile parsing with delta and thin-pack
+  resolution, so a push is ingested without forking `git`.
+- **Fetch / clone** — incremental packs assembled from recorded pushes, and a
+  whole-repo clone streamed directly from the bucket.
+- **Object reads** — Go tree/commit parsers over a pooled `cat-file`, plus a
+  random-access pack reader that resolves objects (deltas included) from pack
+  data paged out of the bucket in blocks — so a replica can serve a repo whose
+  packs never touch its disk.
+
+The result: no fork-per-request under load, and reads served against packs that
+live in object storage. What forge deliberately does **not** reinvent is
+protocol negotiation or pack generation — those stay on git, and every Go path
+falls back to it.
 
 ## Configuration
 
