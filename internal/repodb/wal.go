@@ -36,6 +36,10 @@ type WAL struct {
 	*SQLite
 	Blobs blobstore.Store
 
+	// bg tracks post-commit background work (flushes, snapshots) so Close
+	// can wait for it instead of tearing the store down underneath it.
+	bg sync.WaitGroup
+
 	// RegenIdx, when set, rebuilds a pack's idx from its bytes (wired to
 	// the ingest parser at boot). Lets inline entries omit the idx.
 	RegenIdx func(pack []byte) ([]byte, error)
@@ -190,6 +194,20 @@ func (w *WAL) repo(repoID string) *walRepo {
 		w.repos[repoID] = r
 	}
 	return r
+}
+
+func (w *WAL) goBackground(f func()) {
+	w.bg.Add(1)
+	go func() {
+		defer w.bg.Done()
+		f()
+	}()
+}
+
+// Close waits for in-flight flushes and snapshots, then closes the index.
+func (w *WAL) Close() error {
+	w.bg.Wait()
+	return w.SQLite.Close()
 }
 
 func walKey(seq int64) string { return fmt.Sprintf("%s%016d.json", walPrefix, seq) }
@@ -396,7 +414,7 @@ func (w *WAL) commitBatch(repoID string, r *walRepo, batch []*walTx) {
 			for _, tx := range accepted {
 				close(tx.done) // durable = success
 			}
-			go w.flushEntry(repoID, r, entry)
+			w.goBackground(func() { w.flushEntry(repoID, r, entry) })
 			if w.OnCommit != nil {
 				w.OnCommit(repoID, entry.Seq, entry.TS, updates)
 			}
@@ -404,12 +422,12 @@ func (w *WAL) commitBatch(repoID string, r *walRepo, batch []*walTx) {
 		}
 		r.seq = entry.Seq
 		if entry.Seq%snapEvery == 0 {
-			go w.snapshot(repoID, r)
+			w.goBackground(func() { w.snapshot(repoID, r) })
 		}
 		for _, tx := range accepted {
 			close(tx.done)
 		}
-		go w.flushEntry(repoID, r, entry)
+		w.goBackground(func() { w.flushEntry(repoID, r, entry) })
 		if w.OnCommit != nil {
 			w.OnCommit(repoID, entry.Seq, entry.TS, updates)
 		}

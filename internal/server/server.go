@@ -312,7 +312,13 @@ func (s *Server) Start(ctx context.Context) {
 	go s.Cache.RunEviction(ctx, time.Minute, s.Cfg.CacheHighPct, s.Cfg.CacheLowPct)
 }
 
-func (s *Server) Close() error { return s.DB.Close() }
+// Close stops background maintenance, then closes the metadata store.
+func (s *Server) Close() error {
+	if s.Maintain != nil {
+		s.Maintain.Close()
+	}
+	return s.DB.Close()
+}
 
 // loadOrCreateSecret persists a random 32-byte secret across restarts.
 func loadOrCreateSecret(path string) ([]byte, error) {

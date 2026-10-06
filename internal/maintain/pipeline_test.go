@@ -282,8 +282,10 @@ type lockProbe struct {
 }
 
 func (s *lockProbe) Delete(ctx context.Context, repoID, name string) error {
-	if s.lock.TryLock() {
-		s.lock.Unlock()
+	// A read probe: concurrent deletes probing at once must not see each
+	// other as the holder; only a held write lock makes it fail.
+	if s.lock.TryRLock() {
+		s.lock.RUnlock()
 	} else {
 		s.held.Add(1)
 	}

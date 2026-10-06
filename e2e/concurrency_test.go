@@ -51,15 +51,18 @@ func TestSameRepoParallelPushStorm(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
-	// Let the trailing nudged maintenance run settle before inspecting the
-	// store (its blob deletes race the assertion otherwise). Generous timeout:
-	// consolidation of a parallel-push storm is CPU-bound and slow on loaded
-	// shared CI runners.
+	// Let any nudged run finish (its blob deletes race the assertion
+	// otherwise), then consolidate once more: packs below the nudge
+	// threshold legitimately remain after a storm. Generous timeout:
+	// consolidation is CPU-bound and slow on loaded shared CI runners.
 	waitFor(t, "maintenance quiescence", 60*time.Second, func() bool {
-		a, _ := e.srv.DB.ListPacks(t.Context(), "demo")
-		time.Sleep(400 * time.Millisecond)
-		b, _ := e.srv.DB.ListPacks(t.Context(), "demo")
-		return len(a) == len(b) && len(b) <= 2
+		return e.srv.Maintain.Idle("demo")
 	})
+	if _, err := e.srv.Maintain.Run(t.Context(), "demo", 1); err != nil {
+		t.Fatalf("final consolidation: %v", err)
+	}
+	if packs, _ := e.srv.DB.ListPacks(t.Context(), "demo"); len(packs) != 1 {
+		t.Fatalf("packs after final consolidation = %d, want 1", len(packs))
+	}
 	e.assertRepoIntegrity("demo")
 }

@@ -66,7 +66,15 @@ type Pipeline struct {
 	BuildHistory bool
 
 	inflight sync.Map // repoID -> struct{}: single-flight for async runs
-	pace     sync.Map // repoID -> *repoPace
+
+	// Background runs (nudges, the worker) derive from bg and are tracked in
+	// running, so Close can stop them and wait instead of leaving them
+	// writing into a store or cache that is being torn down.
+	bgOnce  sync.Once
+	bg      context.Context
+	stop    context.CancelFunc
+	running sync.WaitGroup
+	pace    sync.Map // repoID -> *repoPace
 
 	// afterBuild, when set (tests only), runs between the unlocked build
 	// and the swap - the window in which concurrent pushes move refs.
@@ -226,8 +234,11 @@ func (p *Pipeline) NudgeIfNeeded(ctx context.Context, repoID string) {
 func (p *Pipeline) runAsync(repoID string, minPacks int) {
 	// Run self-guards with the same inflight map, so a duplicate nudge while
 	// a run is in flight is dropped there (returns a no-op report).
+	bg := p.background()
+	p.running.Add(1)
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), nudgeTimeout)
+		defer p.running.Done()
+		ctx, cancel := context.WithTimeout(bg, nudgeTimeout)
 		defer cancel()
 		res, err := p.Run(ctx, repoID, minPacks)
 		if err != nil {
@@ -512,6 +523,18 @@ func (p *Pipeline) sweepOrphans(ctx context.Context, repoID string) (int, error)
 // runs the pipeline for each (paced repos are skipped until their window
 // passes).
 func (p *Pipeline) Worker(ctx context.Context, interval time.Duration) {
+	p.running.Add(1)
+	defer p.running.Done()
+	bg := p.background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-bg.Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -525,6 +548,26 @@ func (p *Pipeline) Worker(ctx context.Context, interval time.Duration) {
 }
 
 // scan is one worker tick.
+func (p *Pipeline) background() context.Context {
+	p.bgOnce.Do(func() { p.bg, p.stop = context.WithCancel(context.Background()) })
+	return p.bg
+}
+
+// Close cancels background maintenance (nudged runs and the worker) and
+// waits for it to stop. A run cancelled mid-build skips its swap; the next
+// process picks the repo up again.
+func (p *Pipeline) Close() {
+	p.background()
+	p.stop()
+	p.running.Wait()
+}
+
+// Idle reports whether no maintenance run is in flight for repoID.
+func (p *Pipeline) Idle(repoID string) bool {
+	_, busy := p.inflight.Load(repoID)
+	return !busy
+}
+
 func (p *Pipeline) scan(ctx context.Context) {
 	minPacks := max(p.MinPacks, 2)
 	repos, err := p.DB.ReposNeedingCompaction(ctx, minPacks)
