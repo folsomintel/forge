@@ -85,9 +85,10 @@ type Config struct {
 	// to the tenant's memory size.
 	MaxPushBytes int64
 
-	// GoReceive enables the fork-free receive fast path (small non-delta
-	// pushes ingested in Go; everything else falls back to git).
-	GoReceive bool
+	// FastPush enables the fork-free receive fast path (pushes ingested in
+	// Go; anything it cannot prove falls back to git). On by default;
+	// FORGE_FAST_PUSH=false is the escape hatch.
+	FastPush bool
 
 	// MaxGitForks bounds concurrent forked git processes so a client
 	// stampede sheds load (503) instead of OOMing a small machine.
@@ -98,9 +99,10 @@ type Config struct {
 	// for the Go-native advertisement).
 	ForkAdvertisement bool
 
-	// GoFetch enables the fork-free fetch fast path (incremental chains
-	// from stored receive packs; clone passthrough of consolidated packs).
-	GoFetch bool
+	// FastFetch enables the fork-free fetch fast path (incremental chains
+	// from stored receive packs, clone passthrough of consolidated packs,
+	// depth-1 clones). On by default; FORGE_FAST_FETCH=false turns it off.
+	FastFetch bool
 
 	// NoStagedPush disables teeing incoming wire packs to the blob store
 	// during the transfer (which turns most big-push uploads into
@@ -111,6 +113,20 @@ type Config struct {
 func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+// envSwitch reads an on/off switch: key, then its deprecated alias, then
+// def. Only "true" and "false" count; anything else is unset.
+func envSwitch(key, alias string, def bool) bool {
+	for _, k := range []string{key, alias} {
+		switch os.Getenv(k) {
+		case "true":
+			return true
+		case "false":
+			return false
+		}
 	}
 	return def
 }
@@ -154,10 +170,10 @@ func FromEnv() Config {
 		PublicURL: os.Getenv("FORGE_PUBLIC_URL"),
 
 		NoStagedPush:      os.Getenv("FORGE_STAGED_PUSH") == "false",
-		GoReceive:         os.Getenv("FORGE_GORECEIVE") == "true",
+		FastPush:          envSwitch("FORGE_FAST_PUSH", "FORGE_GORECEIVE", true),
 		MaxGitForks:       envInt("FORGE_MAX_GIT_FORKS", 0),
 		ForkAdvertisement: os.Getenv("FORGE_FORK_ADVERTISEMENT") == "true",
-		GoFetch:           os.Getenv("FORGE_GOFETCH") == "true",
+		FastFetch:         envSwitch("FORGE_FAST_FETCH", "FORGE_GOFETCH", true),
 		MaxPushBytes:      envInt64("FORGE_MAX_PUSH_BYTES", 0),
 	}
 }

@@ -27,10 +27,10 @@ import (
 // cache repos use) and lift its capability sets for v0 upload-pack, v2
 // upload-pack, and receive-pack. Whatever git would advertise on this box,
 // we advertise - drift is impossible. The POST side stays split: pushes
-// land in tryGoReceive or git; v2 ls-refs and bundle-uri are answered in
+// land in tryFastPush or git; v2 ls-refs and bundle-uri are answered in
 // Go; fetch negotiation still forks git.
 
-const goAgent = "agent=forge/goadv"
+const goAgent = "agent=forge/fastrefs"
 
 // v2CommandMaxBytes bounds the buffered upload-pack POST we inspect for
 // v2 metadata commands; a bigger body (a real fetch negotiation) streams
@@ -364,11 +364,11 @@ func (h *Handler) goInfoRefs(w http.ResponseWriter, r *http.Request, service, re
 	return true
 }
 
-// goUploadPackCommand intercepts protocol-v2 upload-pack commands that are
+// fastUploadPackCommand intercepts protocol-v2 upload-pack commands that are
 // pure ref/metadata reads (ls-refs, bundle-uri) and answers them in Go.
 // Returns handled=false for anything else (fetch, object-info) - the
 // caller replays the body to git.
-func (h *Handler) goUploadPackCommand(w http.ResponseWriter, r *http.Request, repo, ns string, body []byte) bool {
+func (h *Handler) fastUploadPackCommand(w http.ResponseWriter, r *http.Request, repo, ns string, body []byte) bool {
 	if h.ForkAdvertisement {
 		return false
 	}
@@ -379,16 +379,16 @@ func (h *Handler) goUploadPackCommand(w http.ResponseWriter, r *http.Request, re
 	cmd := strings.TrimSuffix(lines[0], "\n")
 	switch cmd {
 	case "command=ls-refs":
-		return h.goLsRefs(w, r, repo, ns, lines[1:])
+		return h.fastLsRefs(w, r, repo, ns, lines[1:])
 	case "command=bundle-uri":
-		return h.goBundleURI(w, repo)
+		return h.fastBundleURI(w, repo)
 	case "command=fetch":
-		return h.goFetch(w, r, repo, ns, lines)
+		return h.fastFetch(w, r, repo, ns, lines)
 	}
 	return false
 }
 
-func (h *Handler) goLsRefs(w http.ResponseWriter, r *http.Request, repo, ns string, args []string) bool {
+func (h *Handler) fastLsRefs(w http.ResponseWriter, r *http.Request, repo, ns string, args []string) bool {
 	ctx := r.Context()
 	repoRow, err := h.DB.GetRepo(ctx, repo)
 	if err != nil {
@@ -464,11 +464,11 @@ func (h *Handler) goLsRefs(w http.ResponseWriter, r *http.Request, repo, ns stri
 	return true
 }
 
-// goBundleURI answers command=bundle-uri from the repo's bundles.conf (the
+// fastBundleURI answers command=bundle-uri from the repo's bundles.conf (the
 // same file git would read). Emits the whole chain in creationToken order
 // with mode=all so git bootstraps from the full and only pulls newer
 // incrementals on later fetches. No bundles advertised = an empty valid list.
-func (h *Handler) goBundleURI(w http.ResponseWriter, repo string) bool {
+func (h *Handler) fastBundleURI(w http.ResponseWriter, repo string) bool {
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")
 	var b bytes.Buffer

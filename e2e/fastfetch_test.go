@@ -16,19 +16,19 @@ import (
 	"github.com/folsomintel/forge/internal/ingest"
 )
 
-func goFetchEnv(t *testing.T) *env {
+func fastFetchEnv(t *testing.T) *env {
 	t.Helper()
 	return startServerWith(t, func(cfg *config.Config) {
-		cfg.GoReceive = true
-		cfg.GoFetch = true
+		cfg.FastPush = true
+		cfg.FastFetch = true
 	})
 }
 
 // The incremental fast path: a follower fetching pushes that arrived via
-// goreceive gets the stored receive packs re-emitted - no git fork.
-func TestGoFetchIncrementalChain(t *testing.T) {
+// the fast push path gets the stored receive packs re-emitted - no git fork.
+func TestFastFetchIncrementalChain(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("inc")
 
 	work := filepath.Join(e.dir, "work")
@@ -44,7 +44,7 @@ func TestGoFetchIncrementalChain(t *testing.T) {
 	follower := filepath.Join(e.dir, "follower")
 	e.git(e.dir, "clone", e.remote("inc", ""), follower)
 
-	// Two more pushes land via goreceive (a 2-pack chain for the follower).
+	// Two more pushes land via fast push (a 2-pack chain for the follower).
 	for i := 0; i < 2; i++ {
 		os.WriteFile(filepath.Join(work, "f.txt"), []byte(fmt.Sprintf("base\nrev %d\n", i)), 0o644)
 		e.git(work, "add", ".")
@@ -52,10 +52,10 @@ func TestGoFetchIncrementalChain(t *testing.T) {
 		e.git(work, "push", "-q", "origin", "HEAD:main")
 	}
 
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	e.git(follower, "fetch", "-q", "origin")
 	e.git(follower, "merge", "-q", "--ff-only", "origin/main")
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 
 	if after.Eligible <= before.Eligible {
 		t.Fatalf("incremental fetch did not use the fast path: before=%+v after=%+v", before, after)
@@ -71,9 +71,9 @@ func TestGoFetchIncrementalChain(t *testing.T) {
 
 // Clone passthrough: a consolidated repo clones straight from the stored
 // gc pack, without materialization or a git fork.
-func TestGoFetchClonePassthrough(t *testing.T) {
+func TestFastFetchClonePassthrough(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("cold")
 
 	work := filepath.Join(e.dir, "work")
@@ -89,10 +89,10 @@ func TestGoFetchClonePassthrough(t *testing.T) {
 	// Consolidate to a single gc pack.
 	e.mustAPI("POST", "/api/repos/cold/maintenance", map[string]any{}, http.StatusOK)
 
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	clone := filepath.Join(e.dir, "clone")
 	e.git(e.dir, "clone", e.remote("cold", ""), clone)
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 
 	if after.CloneStream <= before.CloneStream {
 		t.Fatalf("clone did not stream from the store: before=%+v after=%+v", before, after)
@@ -106,9 +106,9 @@ func TestGoFetchClonePassthrough(t *testing.T) {
 // Cross-branch blob reuse via real git: whatever git chooses to put in
 // the push pack, the follower's fetch must end up byte-correct (served
 // fast when the pack is self-contained, via git otherwise).
-func TestGoFetchCrossBranchBlobReuse(t *testing.T) {
+func TestFastFetchCrossBranchBlobReuse(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("lin")
 
 	work := filepath.Join(e.dir, "work")
@@ -148,9 +148,9 @@ func TestGoFetchCrossBranchBlobReuse(t *testing.T) {
 // hand-crafted push whose pack references a server-known blob WITHOUT
 // including it. The chain pack alone would hand a follower a broken
 // closure; the lineage proof must reject it and git must serve the fetch.
-func TestGoFetchLineageFallback(t *testing.T) {
+func TestFastFetchLineageFallback(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("lin2")
 
 	work := filepath.Join(e.dir, "work")
@@ -181,10 +181,10 @@ func TestGoFetchLineageFallback(t *testing.T) {
 	// connectivity passes and it lands as an external).
 	newTip := e.rawPushReferencing(t, "lin2", "refs/heads/main", baseTip, blobX)
 
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	e.git(follower, "fetch", "-q", "origin", "main")
 	e.git(follower, "merge", "-q", "--ff-only", newTip)
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 
 	// Content correct (git served it after the lineage rejection)...
 	got, err := os.ReadFile(filepath.Join(follower, "copy.txt"))
@@ -255,9 +255,9 @@ func gitOID(typ string, data []byte) string {
 // Security: an ephemeral (refs/namespaces/*) tip must not be fetchable
 // through the normal view by oid, and a normal clone must not receive
 // ephemeral objects via clone passthrough.
-func TestGoFetchNamespaceIsolation(t *testing.T) {
+func TestFastFetchNamespaceIsolation(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("nsiso")
 
 	work := filepath.Join(e.dir, "work")
@@ -279,13 +279,13 @@ func TestGoFetchNamespaceIsolation(t *testing.T) {
 	// The fetch fast path must NOT serve the ephemeral tip by oid: it is not
 	// a visible ref tip, so the visibility gate declines it (whatever the
 	// fork path then chooses to do under git's own namespace rules).
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	victim := filepath.Join(e.dir, "victim")
 	e.git(e.dir, "clone", "-q", e.remote("nsiso", ""), victim)
 	e.git(victim, "config", "user.email", "v@e")
 	e.git(victim, "config", "user.name", "v")
 	e.gitErr(victim, "fetch", "-q", "origin", ephTip) // outcome is git's call
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	if after.Eligible > before.Eligible {
 		t.Fatalf("fast path served an ephemeral oid: before=%+v after=%+v", before, after)
 	}
@@ -305,9 +305,9 @@ func TestGoFetchNamespaceIsolation(t *testing.T) {
 
 // Depth-1 clone (the agent checkout): served in Go from the tip's tree
 // closure, with the tip recorded as the shallow boundary.
-func TestGoFetchShallowClone(t *testing.T) {
+func TestFastFetchShallowClone(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("shal")
 
 	work := filepath.Join(e.dir, "work")
@@ -323,10 +323,10 @@ func TestGoFetchShallowClone(t *testing.T) {
 		e.git(work, "push", "-q", "origin", "HEAD:main")
 	}
 
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	clone := filepath.Join(e.dir, "clone")
 	e.git(e.dir, "clone", "-q", "--depth", "1", e.remote("shal", ""), clone)
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 
 	if after.ShallowClone <= before.ShallowClone {
 		t.Fatalf("depth-1 clone did not use the fast path: before=%+v after=%+v", before, after)
@@ -345,16 +345,16 @@ func TestGoFetchShallowClone(t *testing.T) {
 	e.git(clone, "fsck", "--strict")
 
 	// The shallow clone pushes on top (the agent session loop); its
-	// "shallow" preamble must not knock the push off goreceive.
+	// "shallow" preamble must not knock the push off the fast path.
 	e.git(clone, "config", "user.email", "t@example.com")
 	e.git(clone, "config", "user.name", "t")
 	os.WriteFile(filepath.Join(clone, "f.txt"), []byte("v3\n"), 0o644)
 	e.git(clone, "commit", "-q", "-am", "c3")
-	recvBefore := e.srv.GitHTTP.GoReceiveStats()
+	recvBefore := e.srv.GitHTTP.FastPushStats()
 	e.git(clone, "push", "-q", "origin", "HEAD:main")
-	recvAfter := e.srv.GitHTTP.GoReceiveStats()
+	recvAfter := e.srv.GitHTTP.FastPushStats()
 	if recvAfter.Eligible <= recvBefore.Eligible || recvAfter.FellBack != recvBefore.FellBack {
-		t.Fatalf("shallow push left goreceive: before=%+v after=%+v", recvBefore, recvAfter)
+		t.Fatalf("shallow push left the fast path: before=%+v after=%+v", recvBefore, recvAfter)
 	}
 	got, err := e.gitErr(e.dir, "ls-remote", e.remote("shal", ""), "refs/heads/main")
 	if err != nil || !strings.HasPrefix(got, strings.TrimSpace(e.git(clone, "rev-parse", "HEAD"))) {
@@ -363,9 +363,9 @@ func TestGoFetchShallowClone(t *testing.T) {
 }
 
 // A root-commit tip has no boundary: the depth-1 clone is complete.
-func TestGoFetchShallowCloneRootCommit(t *testing.T) {
+func TestFastFetchShallowCloneRootCommit(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("root")
 
 	work := filepath.Join(e.dir, "work")
@@ -377,10 +377,10 @@ func TestGoFetchShallowCloneRootCommit(t *testing.T) {
 	e.git(work, "commit", "-q", "-m", "root")
 	e.git(work, "push", "-q", "origin", "HEAD:main")
 
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	clone := filepath.Join(e.dir, "clone")
 	e.git(e.dir, "clone", "-q", "--depth", "1", e.remote("root", ""), clone)
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 
 	if after.ShallowClone <= before.ShallowClone {
 		t.Fatalf("depth-1 clone did not use the fast path: before=%+v after=%+v", before, after)
@@ -393,9 +393,9 @@ func TestGoFetchShallowCloneRootCommit(t *testing.T) {
 
 // Deeper histories need git's boundary negotiation: --depth 2 falls back
 // and is still correct.
-func TestGoFetchShallowDepth2FallsBack(t *testing.T) {
+func TestFastFetchShallowDepth2FallsBack(t *testing.T) {
 	t.Parallel()
-	e := goFetchEnv(t)
+	e := fastFetchEnv(t)
 	e.createRepo("d2")
 
 	work := filepath.Join(e.dir, "work")
@@ -409,10 +409,10 @@ func TestGoFetchShallowDepth2FallsBack(t *testing.T) {
 		e.git(work, "push", "-q", "origin", "HEAD:main")
 	}
 
-	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	before := e.srv.GitHTTP.FastFetchStatsSnapshot()
 	clone := filepath.Join(e.dir, "clone")
 	e.git(e.dir, "clone", "-q", "--depth", "2", e.remote("d2", ""), clone)
-	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	after := e.srv.GitHTTP.FastFetchStatsSnapshot()
 
 	if after.ShallowClone != before.ShallowClone || after.FellBackBy["args"] <= before.FellBackBy["args"] {
 		t.Fatalf("depth 2 should fall back on args: before=%+v after=%+v", before, after)

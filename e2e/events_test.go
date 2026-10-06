@@ -81,7 +81,7 @@ func nextEvent(t *testing.T, ch <-chan sseEvent, what string) sseEvent {
 // git-fallback both funnel through the WAL).
 func TestRefEventsLive(t *testing.T) {
 	t.Parallel()
-	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e := startServerWith(t, func(cfg *config.Config) { cfg.FastPush = true })
 	e.createRepo("ev")
 
 	ch, cancel := sseCollect(t, e, "/api/repos/ev/events")
@@ -115,7 +115,7 @@ func TestRefEventsLive(t *testing.T) {
 // it missed, in order, from the WAL.
 func TestRefEventsReplay(t *testing.T) {
 	t.Parallel()
-	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e := startServerWith(t, func(cfg *config.Config) { cfg.FastPush = true })
 	e.createRepo("rp")
 
 	for i, name := range []string{"a.txt", "b.txt", "c.txt"} {

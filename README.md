@@ -104,6 +104,7 @@ Everything is set through `FORGE_*` environment variables. The common ones:
 | `FORGE_DATA_DIR` | | cache and SQLite index (disposable) |
 | `FORGE_PUBLIC_URL` | | enables bundle-uri clone offload |
 | `FORGE_RATE_API`, `FORGE_RATE_GIT` | | per-subject rate limits |
+| `FORGE_FAST_PUSH`, `FORGE_FAST_FETCH` | `true` | Go push and fetch paths; `false` sends everything to Git |
 | `FORGE_REPLICA` | `false` | read-only follower |
 | `FORGE_REMOTE_PLACEMENT_BYTES` | `0` | on a replica, serve repos over N bytes from the bucket |
 

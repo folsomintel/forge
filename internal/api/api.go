@@ -39,12 +39,12 @@ type Server struct {
 	// ActiveTransfers reports in-flight git transfers (githttp), for the
 	// drain-before-restart signal in /api/usage.
 	ActiveTransfers func() int64
-	// GoReceiveStats, when set, reports fork-free receive fast-path
+	// FastPushStats, when set, reports fork-free receive fast-path
 	// decision counts for /api/usage, including the fallback-cause
 	// breakdown that makes a non-engaging fast path diagnosable.
-	GoReceiveStats func() GoReceiveOut
-	// GoFetchStats, when set, reports the fork-free fetch counters.
-	GoFetchStats func() GoFetchOut
+	FastPushStats func() FastPushOut
+	// FastFetchStats, when set, reports the fork-free fetch counters.
+	FastFetchStats func() FastFetchOut
 	// Events, when set, enables the SSE ref-event streams.
 	Events *events.Hub
 }

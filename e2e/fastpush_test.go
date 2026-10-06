@@ -17,12 +17,12 @@ import (
 
 // The load-test finding: real `git push` sends thin/delta packs, so the
 // fast path must handle them, not just the no-delta first push. This test
-// drives real git through GoReceive and asserts the incremental pushes -
+// drives real git through FastPush and asserts the incremental pushes -
 // the hot path - are served in Go, and that what it stored is a clone-able
 // repo.
-func TestGoReceiveHandlesRealGitPushes(t *testing.T) {
+func TestFastPushHandlesRealGitPushes(t *testing.T) {
 	t.Parallel()
-	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e := startServerWith(t, func(cfg *config.Config) { cfg.FastPush = true })
 	e.createRepo("fast")
 
 	work := filepath.Join(e.dir, "work")
@@ -51,9 +51,9 @@ func TestGoReceiveHandlesRealGitPushes(t *testing.T) {
 		_ = i
 	}
 
-	stats := e.srv.GitHTTP.GoReceiveStats()
+	stats := e.srv.GitHTTP.FastPushStats()
 	if stats.Eligible < 3 {
-		t.Fatalf("goreceive not engaging on real pushes: eligible=%d fell_back=%d by=%v",
+		t.Fatalf("fast push not engaging on real pushes: eligible=%d fell_back=%d by=%v",
 			stats.Eligible, stats.FellBack, stats.FellBackBy)
 	}
 
@@ -62,11 +62,11 @@ func TestGoReceiveHandlesRealGitPushes(t *testing.T) {
 	e.git(e.dir, "clone", e.remote("fast", ""), verify)
 	got, err := os.ReadFile(filepath.Join(verify, "a.txt"))
 	if err != nil {
-		t.Fatalf("clone after goreceive pushes: %v", err)
+		t.Fatalf("clone after fast-path pushes: %v", err)
 	}
 	want := "line one\nCHANGED two\nline three\nline four\nline five\n"
 	if string(got) != want {
-		t.Fatalf("content after goreceive pushes = %q, want %q", got, want)
+		t.Fatalf("content after fast-path pushes = %q, want %q", got, want)
 	}
 	if out := e.git(verify, "fsck", "--strict"); out != "" {
 		t.Logf("fsck output: %s", out)
@@ -75,9 +75,9 @@ func TestGoReceiveHandlesRealGitPushes(t *testing.T) {
 
 // Branch cleanup (an all-delete push carries no pack) is served in Go; a
 // delete of the default branch still goes to git, which refuses it.
-func TestGoReceiveDeleteOnlyPush(t *testing.T) {
+func TestFastPushDeleteOnlyPush(t *testing.T) {
 	t.Parallel()
-	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e := startServerWith(t, func(cfg *config.Config) { cfg.FastPush = true })
 	e.createRepo("del")
 
 	work := filepath.Join(e.dir, "work")
@@ -89,9 +89,9 @@ func TestGoReceiveDeleteOnlyPush(t *testing.T) {
 	e.git(work, "commit", "-q", "-m", "base")
 	e.git(work, "push", "-q", "origin", "HEAD:main", "HEAD:refs/heads/scratch-1", "HEAD:refs/heads/scratch-2")
 
-	before := e.srv.GitHTTP.GoReceiveStats()
+	before := e.srv.GitHTTP.FastPushStats()
 	e.git(work, "push", "-q", "origin", "--delete", "scratch-1", "scratch-2")
-	after := e.srv.GitHTTP.GoReceiveStats()
+	after := e.srv.GitHTTP.FastPushStats()
 	if after.Eligible != before.Eligible+1 || after.FellBack != before.FellBack {
 		t.Fatalf("delete-only push left the fast path: before=%+v after=%+v", before, after)
 	}
@@ -103,7 +103,7 @@ func TestGoReceiveDeleteOnlyPush(t *testing.T) {
 	if _, err := e.gitErr(work, "push", "-q", "origin", "--delete", "main"); err == nil {
 		t.Logf("git accepted deleting the default branch (bare repo)")
 	}
-	after = e.srv.GitHTTP.GoReceiveStats()
+	after = e.srv.GitHTTP.FastPushStats()
 	if after.Eligible != before.Eligible || after.FellBackBy["ref_delete"] <= before.FellBackBy["ref_delete"] {
 		t.Fatalf("default-branch delete must go to git: before=%+v after=%+v", before, after)
 	}
@@ -112,9 +112,9 @@ func TestGoReceiveDeleteOnlyPush(t *testing.T) {
 // A crafted push with a ref name git refuses must never be stored: ref
 // names become cache file paths, and refs/heads/../../x once escaped the
 // repo directory. The normal view also may not write hidden namespace refs.
-func TestGoReceiveRejectsFunnyAndHiddenRefs(t *testing.T) {
+func TestFastPushRejectsFunnyAndHiddenRefs(t *testing.T) {
 	t.Parallel()
-	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e := startServerWith(t, func(cfg *config.Config) { cfg.FastPush = true })
 	e.createRepo("funny")
 
 	work := filepath.Join(e.dir, "work")
@@ -168,7 +168,7 @@ func TestGoReceiveRejectsFunnyAndHiddenRefs(t *testing.T) {
 	if out := e.git(work, "ls-remote", e.remote("funny", "+ephemeral")); strings.Contains(out, "sneaky") {
 		t.Fatalf("hidden ref created from the normal view:\n%s", out)
 	}
-	if by := e.srv.GitHTTP.GoReceiveStats().FellBackBy; by["ref_name"] < 4 {
+	if by := e.srv.GitHTTP.FastPushStats().FellBackBy; by["ref_name"] < 4 {
 		t.Fatalf("funny/hidden refs should fall back on ref_name: %v", by)
 	}
 }

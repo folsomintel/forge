@@ -80,8 +80,9 @@ type Cache struct {
 	// Best-effort: it must never fail a materialization.
 	Hydrate func(ctx context.Context, repoID, dir string)
 
-	mu    sync.Mutex
-	locks map[string]*sync.RWMutex
+	mu     sync.Mutex
+	locks  map[string]*sync.RWMutex
+	fences map[string]*sync.RWMutex
 
 	// Materialize fast path: skip the whole refs/packs sync when a repo's
 	// per-repo change token is unchanged since it was last synced. Per-repo
@@ -129,7 +130,7 @@ func (c *Cache) upToDate(ctx context.Context, repoID string) bool {
 
 // markSyncedAt records that repoID's cache reflects state as of tok. The
 // token MUST be sampled BEFORE the sync reads refs/packs: a lock-free push
-// (goreceive / API writes hold no repo lock) can bump the token during the
+// (fast-push / API writes hold no repo lock) can bump the token during the
 // sync, and storing the post-sync token would mark the cache fresh at a
 // value newer than what it actually contains - pinning stale refs until the
 // next write. Storing the pre-sync token means such a push leaves
@@ -220,6 +221,26 @@ func (c *Cache) Lock(repoID string) *sync.RWMutex {
 		c.locks[repoID] = l
 	}
 	return l
+}
+
+// PackFence orders lock-free fast-path pushes against a consolidation
+// swap: a push holds it shared from its connectivity proof through its
+// ref commit, the swap holds it exclusively while it re-checks moved refs
+// and replaces the pack list. A push proven against packs the swap then
+// removes would otherwise commit refs whose objects are gone. Separate
+// from Lock so a push's lazy materialize can never wait on a fence holder.
+func (c *Cache) PackFence(repoID string) *sync.RWMutex {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fences == nil {
+		c.fences = map[string]*sync.RWMutex{}
+	}
+	f, ok := c.fences[repoID]
+	if !ok {
+		f = &sync.RWMutex{}
+		c.fences[repoID] = f
+	}
+	return f
 }
 
 func (c *Cache) RepoDir(repoID string) string {

@@ -52,11 +52,11 @@ type Handler struct {
 	// plane reads it (via /api/usage) to drain before restarts.
 	active atomic.Int64
 
-	// GoReceive enables the fork-free receive fast path (env
-	// FORGE_GORECEIVE). Off by default: it falls back to git on anything it
-	// cannot prove, but it writes repo truth, so it earns its way on.
-	GoReceive bool
-	goRecv    goReceiveCounters
+	// FastPush enables the fork-free receive fast path (env
+	// FORGE_FAST_PUSH, on by default). It falls back to git on anything it
+	// cannot prove.
+	FastPush bool
+	pushCtr  fastPushCounters
 
 	// MaxGitForks bounds concurrent forked git processes (advertisement +
 	// service fallback). A synchronized 64-writer stampede once OOM-killed
@@ -74,11 +74,12 @@ type Handler struct {
 	peeled            sync.Map     // tag oid -> peeled oid ("" = not a tag); tags are immutable
 	peeledN           atomic.Int64 // approximate live entries in peeled, for the cap
 
-	// GoFetch enables the fork-free fetch fast path (incremental chains
+	// FastFetch enables the fork-free fetch fast path (incremental chains
 	// from stored receive packs + clone passthrough of consolidated
-	// packs; env FORGE_GOFETCH). Everything unprovable falls back to git.
-	GoFetch     bool
-	goFetchCtr  goFetchCounters
+	// packs, depth-1 clones; env FORGE_FAST_FETCH, on by default).
+	// Everything unprovable falls back to git.
+	FastFetch   bool
+	fetchCtr    fastFetchCounters
 	transitions transitionMap
 
 	// NudgeMaintain, when set, kicks a threshold-gated maintenance run after
@@ -90,8 +91,8 @@ type Handler struct {
 // ActiveTransfers reports in-flight git transfer requests.
 func (h *Handler) ActiveTransfers() int64 { return h.active.Load() }
 
-// GoReceiveStats reports fast-path decision counts (eligible/fell-back/rejected).
-func (h *Handler) GoReceiveStats() GoReceiveStats { return h.goRecv.snapshot() }
+// FastPushStats reports fast-path decision counts (eligible/fell-back/rejected).
+func (h *Handler) FastPushStats() FastPushStats { return h.pushCtr.snapshot() }
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{repo}/info/refs", h.infoRefs)
@@ -262,8 +263,8 @@ func (h *Handler) service(w http.ResponseWriter, r *http.Request, service string
 	// Fork-free fast paths first: they touch only the store and the DB, so
 	// they need NO repo lock and NO materialization - a self-contained push
 	// or a v2 metadata read never waits behind a repack or hydration.
-	if service == "git-receive-pack" && h.GoReceive {
-		buf, full, err := readUpTo(body, goReceiveMaxBytes)
+	if service == "git-receive-pack" && h.FastPush {
+		buf, full, err := readUpTo(body, fastPushMaxBytes)
 		if err != nil {
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
@@ -271,16 +272,16 @@ func (h *Handler) service(w http.ResponseWriter, r *http.Request, service string
 		if full {
 			w.Header().Set("Content-Type", fmt.Sprintf("application/x-%s-result", service))
 			w.Header().Set("Cache-Control", "no-cache")
-			if h.tryGoReceive(w, r, repo, ns, claims.Subject, buf) {
+			if h.tryFastPush(w, r, repo, ns, claims.Subject, buf) {
 				return
 			}
 			// Fell back: hand the buffered body to git unchanged.
-			h.goRecv.fellBack.Add(1)
+			h.pushCtr.fellBack.Add(1)
 			body = bytes.NewReader(buf)
 		} else {
 			// Too big for the fast path: replay the prefix, keep streaming.
-			h.goRecv.fellBack.Add(1)
-			h.goRecv.fbOversize.Add(1)
+			h.pushCtr.fellBack.Add(1)
+			h.pushCtr.fbOversize.Add(1)
 			body = io.MultiReader(bytes.NewReader(buf), body)
 		}
 	}
@@ -293,7 +294,7 @@ func (h *Handler) service(w http.ResponseWriter, r *http.Request, service string
 			http.Error(w, "read error", http.StatusBadRequest)
 			return
 		}
-		if full && h.goUploadPackCommand(w, r, repo, ns, buf) {
+		if full && h.fastUploadPackCommand(w, r, repo, ns, buf) {
 			return
 		}
 		body = io.MultiReader(bytes.NewReader(buf), body)

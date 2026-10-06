@@ -7,7 +7,7 @@ import (
 
 // parsePktCommands is the first parser an authenticated push body hits.
 // It must never panic, and when it accepts, its outputs must satisfy the
-// bounds tryGoReceive indexes with.
+// bounds tryFastPush indexes with.
 func FuzzParsePktCommands(f *testing.F) {
 	// A realistic command section: one update + capabilities, flush, "PACK".
 	var b bytes.Buffer

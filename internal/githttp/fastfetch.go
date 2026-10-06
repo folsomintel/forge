@@ -20,7 +20,7 @@ import (
 	"github.com/folsomintel/forge/internal/repodb"
 )
 
-// The fork-free fetch fast path - the read-side twin of goreceive.
+// The fork-free fetch fast path - the read-side twin of the fast push path.
 //
 // Two shapes are served entirely in Go:
 //
@@ -49,22 +49,22 @@ import (
 // a have, a chain link, or it is found by a bounded walk of a have's own
 // tree. Anything unproven falls back to git - which is always correct.
 
-// goFetchMaxChain / goFetchMaxBytes bound the incremental union.
+// fastFetchMaxChain / fastFetchMaxBytes bound the incremental union.
 const (
-	goFetchMaxChain = 16
-	goFetchMaxBytes = 4 << 20
-	// goFetchBFSCap bounds the client-closure proof walk (cat-file reads).
-	goFetchBFSCap = 768
+	fastFetchMaxChain = 16
+	fastFetchMaxBytes = 4 << 20
+	// fastFetchBFSCap bounds the client-closure proof walk (cat-file reads).
+	fastFetchBFSCap = 768
 	// transitionCap bounds the in-memory transition window.
 	transitionCap = 8192
-	// goFetchShallowMaxObjects / goFetchShallowMaxBytes bound a depth-1
+	// fastFetchShallowMaxObjects / fastFetchShallowMaxBytes bound a depth-1
 	// clone served in Go (the whole response is built in memory).
-	goFetchShallowMaxObjects = 20000
-	goFetchShallowMaxBytes   = 8 << 20
+	fastFetchShallowMaxObjects = 20000
+	fastFetchShallowMaxBytes   = 8 << 20
 )
 
-// GoFetchStats mirrors GoReceiveStats for the fetch fast path.
-type GoFetchStats struct {
+// FastFetchStats mirrors FastPushStats for the fetch fast path.
+type FastFetchStats struct {
 	Eligible     int64            `json:"eligible"`
 	CloneStream  int64            `json:"clone_stream"`
 	ShallowClone int64            `json:"shallow_clone"`
@@ -72,7 +72,7 @@ type GoFetchStats struct {
 	FellBackBy   map[string]int64 `json:"fell_back_by,omitempty"`
 }
 
-type goFetchCounters struct {
+type fastFetchCounters struct {
 	eligible     atomic.Int64
 	cloneStream  atomic.Int64
 	shallowClone atomic.Int64
@@ -88,7 +88,7 @@ type goFetchCounters struct {
 	fbShallowCap  atomic.Int64 // depth-1 closure over the object/byte bound
 }
 
-func (c *goFetchCounters) snapshot() GoFetchStats {
+func (c *fastFetchCounters) snapshot() FastFetchStats {
 	by := map[string]int64{}
 	for name, v := range map[string]*atomic.Int64{
 		"args": &c.fbArgs, "clone_miss": &c.fbCloneMiss, "chain_miss": &c.fbChainMiss,
@@ -99,15 +99,15 @@ func (c *goFetchCounters) snapshot() GoFetchStats {
 			by[name] = n
 		}
 	}
-	return GoFetchStats{
+	return FastFetchStats{
 		Eligible: c.eligible.Load(), CloneStream: c.cloneStream.Load(),
 		ShallowClone: c.shallowClone.Load(),
 		FellBack:     c.fellBack.Load(), FellBackBy: by,
 	}
 }
 
-// GoFetchStatsSnapshot reports fetch fast-path decision counts.
-func (h *Handler) GoFetchStatsSnapshot() GoFetchStats { return h.goFetchCtr.snapshot() }
+// FastFetchStatsSnapshot reports fetch fast-path decision counts.
+func (h *Handler) FastFetchStatsSnapshot() FastFetchStats { return h.fetchCtr.snapshot() }
 
 // transition is one recorded push edge: newOID was created by pack, whose
 // parent state was oldOID, referencing externals outside the pack.
@@ -170,7 +170,7 @@ type fetchArgs struct {
 
 // parseFetchArgs returns ok=false for any argument the fast path does not
 // model (client shallows, filter, want-ref, ...) - those requests belong
-// to git. "deepen N" is parsed; goFetch decides which depths it serves.
+// to git. "deepen N" is parsed; fastFetch decides which depths it serves.
 func parseFetchArgs(lines []string) (fetchArgs, bool) {
 	fa := fetchArgs{haves: map[string]bool{}}
 	inArgs := false
@@ -220,19 +220,19 @@ func parseFetchArgs(lines []string) (fetchArgs, bool) {
 	return fa, len(fa.wants) > 0
 }
 
-// goFetch serves a v2 fetch command in Go, or returns false for git.
-func (h *Handler) goFetch(w http.ResponseWriter, r *http.Request, repo, ns string, lines []string) bool {
-	if !h.GoFetch || ns != "" {
+// fastFetch serves a v2 fetch command in Go, or returns false for git.
+func (h *Handler) fastFetch(w http.ResponseWriter, r *http.Request, repo, ns string, lines []string) bool {
+	if !h.FastFetch || ns != "" {
 		return false
 	}
 	fail := func(c *atomic.Int64) bool {
 		c.Add(1)
-		h.goFetchCtr.fellBack.Add(1)
+		h.fetchCtr.fellBack.Add(1)
 		return false
 	}
 	fa, ok := parseFetchArgs(lines)
 	if !ok {
-		return fail(&h.goFetchCtr.fbArgs)
+		return fail(&h.fetchCtr.fbArgs)
 	}
 	ctx := r.Context()
 
@@ -241,17 +241,17 @@ func (h *Handler) goFetch(w http.ResponseWriter, r *http.Request, repo, ns strin
 		// shallow repo deepening/fetching with haves, need git's boundary
 		// negotiation.
 		if fa.deepen != 1 || len(fa.haves) > 0 || !fa.done {
-			return fail(&h.goFetchCtr.fbArgs)
+			return fail(&h.fetchCtr.fbArgs)
 		}
-		return h.goFetchShallow(ctx, w, repo, fa)
+		return h.fastFetchShallow(ctx, w, repo, fa)
 	}
 	if len(fa.haves) == 0 {
 		if !fa.done {
-			return fail(&h.goFetchCtr.fbCloneMiss)
+			return fail(&h.fetchCtr.fbCloneMiss)
 		}
-		return h.goFetchClone(ctx, w, repo, fa)
+		return h.fastFetchClone(ctx, w, repo, fa)
 	}
-	return h.goFetchIncremental(ctx, w, repo, fa)
+	return h.fastFetchIncremental(ctx, w, repo, fa)
 }
 
 // --- clone passthrough ---
@@ -279,12 +279,12 @@ func (h *Handler) visibleTips(ctx context.Context, repo string) (tips map[string
 	return tips, hasHidden, nil
 }
 
-// goFetchClone streams the repo's single consolidated pack when it covers
+// fastFetchClone streams the repo's single consolidated pack when it covers
 // every want: the cold-clone case right after maintenance.
-func (h *Handler) goFetchClone(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
+func (h *Handler) fastFetchClone(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
 	fail := func(c *atomic.Int64) bool {
 		c.Add(1)
-		h.goFetchCtr.fellBack.Add(1)
+		h.fetchCtr.fellBack.Add(1)
 		return false
 	}
 	// The gc pack packs the closure of EVERY ref, including hidden
@@ -293,7 +293,7 @@ func (h *Handler) goFetchClone(ctx context.Context, w http.ResponseWriter, repo 
 	// bail whenever the repo has any hidden ref - git serves those clones.
 	_, hasHidden, err := h.visibleTips(ctx, repo)
 	if err != nil || hasHidden {
-		return fail(&h.goFetchCtr.fbCloneMiss)
+		return fail(&h.fetchCtr.fbCloneMiss)
 	}
 	// A repo with exactly one self-owned pack always contains the full closure
 	// of every ref: a second push would add a second pack (len>1 bails), and
@@ -304,16 +304,16 @@ func (h *Handler) goFetchClone(ctx context.Context, w http.ResponseWriter, repo 
 	// streams. BlobRepo != "" (a fork sharing the owner's blobs) still bails.
 	packs, err := h.DB.ListPacks(ctx, repo)
 	if err != nil || len(packs) != 1 || packs[0].BlobRepo != "" {
-		return fail(&h.goFetchCtr.fbCloneMiss)
+		return fail(&h.fetchCtr.fbCloneMiss)
 	}
 	name := packs[0].Name
 	idx, err := h.readPackAux(ctx, repo, name+".idx")
 	if err != nil {
-		return fail(&h.goFetchCtr.fbPackRead)
+		return fail(&h.fetchCtr.fbPackRead)
 	}
 	for _, want := range fa.wants {
 		if !idxContains(idx, want) {
-			return fail(&h.goFetchCtr.fbCloneMiss) // ref moved since gc
+			return fail(&h.fetchCtr.fbCloneMiss) // ref moved since gc
 		}
 	}
 	// Stream: local pack file when materialized, else straight from the
@@ -327,32 +327,32 @@ func (h *Handler) goFetchClone(ctx context.Context, w http.ResponseWriter, repo 
 	if src == nil {
 		rc, err := h.Blobs.Get(ctx, repo, name+".pack")
 		if err != nil {
-			return fail(&h.goFetchCtr.fbPackRead)
+			return fail(&h.fetchCtr.fbPackRead)
 		}
 		src = rc
 	}
 	defer src.Close()
-	h.goFetchCtr.eligible.Add(1)
-	h.goFetchCtr.cloneStream.Add(1)
+	h.fetchCtr.eligible.Add(1)
+	h.fetchCtr.cloneStream.Add(1)
 	writeFetchResponse(w, nil, src)
 	return true
 }
 
 // --- shallow (depth 1) clone ---
 
-// goFetchShallow serves `deepen 1` with no haves: each want's commit plus
+// fastFetchShallow serves `deepen 1` with no haves: each want's commit plus
 // its full tree closure. Wants must be visible tips, so the walk never
 // reaches hidden objects; gitlinks are skipped (not our objects). A want
 // with parents becomes a shallow boundary the client records.
-func (h *Handler) goFetchShallow(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
+func (h *Handler) fastFetchShallow(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
 	fail := func(c *atomic.Int64) bool {
 		c.Add(1)
-		h.goFetchCtr.fellBack.Add(1)
+		h.fetchCtr.fellBack.Add(1)
 		return false
 	}
 	refs, err := h.DB.ListRefs(ctx, repo)
 	if err != nil {
-		return fail(&h.goFetchCtr.fbShallowMiss)
+		return fail(&h.fetchCtr.fbShallowMiss)
 	}
 	tips := make(map[string]bool, len(refs))
 	hasTags := false
@@ -367,17 +367,17 @@ func (h *Handler) goFetchShallow(ctx context.Context, w http.ResponseWriter, rep
 	}
 	for _, want := range fa.wants {
 		if !tips[want] {
-			return fail(&h.goFetchCtr.fbShallowMiss)
+			return fail(&h.fetchCtr.fbShallowMiss)
 		}
 	}
 	// include-tag would need annotated tags pointing at the wants; git
 	// decides those.
 	if fa.includeTag && hasTags {
-		return fail(&h.goFetchCtr.fbTags)
+		return fail(&h.fetchCtr.fbTags)
 	}
 	dir, err := h.Cache.MaterializeServe(ctx, repo)
 	if err != nil {
-		return fail(&h.goFetchCtr.fbShallowMiss)
+		return fail(&h.fetchCtr.fbShallowMiss)
 	}
 
 	type item struct{ typ, oid string }
@@ -399,18 +399,18 @@ func (h *Handler) goFetchShallow(ctx context.Context, w http.ResponseWriter, rep
 		queue = queue[1:]
 		data, err := h.Cache.BlobContents(repo, dir, it.oid)
 		if err != nil {
-			return fail(&h.goFetchCtr.fbShallowMiss)
+			return fail(&h.fetchCtr.fbShallowMiss)
 		}
 		total += len(data)
-		if len(objs) >= goFetchShallowMaxObjects || total > goFetchShallowMaxBytes {
-			return fail(&h.goFetchCtr.fbShallowCap)
+		if len(objs) >= fastFetchShallowMaxObjects || total > fastFetchShallowMaxBytes {
+			return fail(&h.fetchCtr.fbShallowCap)
 		}
 		objs = append(objs, ingest.PackObject{Type: it.typ, OID: it.oid, Data: data})
 		switch it.typ {
 		case "commit":
 			tree, hasParent, ok := commitTreeAndParent(data)
 			if !ok {
-				return fail(&h.goFetchCtr.fbShallowMiss)
+				return fail(&h.fetchCtr.fbShallowMiss)
 			}
 			if hasParent {
 				shallow = append(shallow, it.oid)
@@ -441,8 +441,8 @@ func (h *Handler) goFetchShallow(ctx context.Context, w http.ResponseWriter, rep
 			info = append(info, "shallow "+oid+"\n")
 		}
 	}
-	h.goFetchCtr.eligible.Add(1)
-	h.goFetchCtr.shallowClone.Add(1)
+	h.fetchCtr.eligible.Add(1)
+	h.fetchCtr.shallowClone.Add(1)
 	writeFetchResponse(w, info, bytes.NewReader(ingest.WritePack(objs)))
 	return true
 }
@@ -465,10 +465,10 @@ func commitTreeAndParent(data []byte) (tree string, hasParent bool, ok bool) {
 
 // --- incremental chain ---
 
-func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
+func (h *Handler) fastFetchIncremental(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
 	fail := func(c *atomic.Int64) bool {
 		c.Add(1)
-		h.goFetchCtr.fellBack.Add(1)
+		h.fetchCtr.fellBack.Add(1)
 		return false
 	}
 
@@ -479,11 +479,11 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 	// still in the transition window. git refuses such wants; so do we.
 	tips, _, err := h.visibleTips(ctx, repo)
 	if err != nil {
-		return fail(&h.goFetchCtr.fbChainMiss)
+		return fail(&h.fetchCtr.fbChainMiss)
 	}
 	for _, want := range fa.wants {
 		if !tips[want] {
-			return fail(&h.goFetchCtr.fbChainMiss)
+			return fail(&h.fetchCtr.fbChainMiss)
 		}
 	}
 
@@ -500,12 +500,12 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 				terminals[cur] = true
 				break
 			}
-			if hop >= goFetchMaxChain {
-				return fail(&h.goFetchCtr.fbChainMiss)
+			if hop >= fastFetchMaxChain {
+				return fail(&h.fetchCtr.fbChainMiss)
 			}
 			tr, ok := h.transitions.get(repo + "\x00" + cur)
 			if !ok {
-				return fail(&h.goFetchCtr.fbChainMiss)
+				return fail(&h.fetchCtr.fbChainMiss)
 			}
 			links[cur] = true
 			if !seenPack[tr.pack] {
@@ -516,7 +516,7 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 			if tr.old == zeroOID {
 				// Chain bottoms out at branch creation: the client's haves
 				// were never reached, so we cannot prove coverage.
-				return fail(&h.goFetchCtr.fbChainMiss)
+				return fail(&h.fetchCtr.fbChainMiss)
 			}
 			cur = tr.old
 		}
@@ -524,7 +524,7 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 	if len(packNames) == 0 {
 		// Everything wanted is already had (up-to-date fetch): an empty
 		// pack response is valid.
-		h.goFetchCtr.eligible.Add(1)
+		h.fetchCtr.eligible.Add(1)
 		writeFetchResponse(w, ackLines(terminals, fa.done), strings.NewReader(emptyPack()))
 		return true
 	}
@@ -533,11 +533,11 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 	// out of that business whenever the repo has tags at all.
 	if fa.includeTag {
 		if refs, err := h.DB.ListRefs(ctx, repo); err != nil {
-			return fail(&h.goFetchCtr.fbPackRead)
+			return fail(&h.fetchCtr.fbPackRead)
 		} else {
 			for _, ref := range refs {
 				if strings.HasPrefix(ref.Name, "refs/tags/") {
-					return fail(&h.goFetchCtr.fbTags)
+					return fail(&h.fetchCtr.fbTags)
 				}
 			}
 		}
@@ -550,15 +550,15 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 	for _, name := range packNames {
 		data, err := h.readPackAux(ctx, repo, name+".pack")
 		if err != nil {
-			return fail(&h.goFetchCtr.fbPackRead)
+			return fail(&h.fetchCtr.fbPackRead)
 		}
 		total += len(data)
-		if total > goFetchMaxBytes {
-			return fail(&h.goFetchCtr.fbChainMiss)
+		if total > fastFetchMaxBytes {
+			return fail(&h.fetchCtr.fbChainMiss)
 		}
 		p, _, err := ingest.ReadPackThin(data, nil)
 		if err != nil {
-			return fail(&h.goFetchCtr.fbPackRead)
+			return fail(&h.fetchCtr.fbPackRead)
 		}
 		for _, o := range p.Objects {
 			if !seenObj[o.OID] {
@@ -581,11 +581,11 @@ func (h *Handler) goFetchIncremental(ctx context.Context, w http.ResponseWriter,
 	}
 	if len(unproven) > 0 {
 		if !h.proveInClientClosure(ctx, repo, terminals, unproven) {
-			return fail(&h.goFetchCtr.fbLineage)
+			return fail(&h.fetchCtr.fbLineage)
 		}
 	}
 
-	h.goFetchCtr.eligible.Add(1)
+	h.fetchCtr.eligible.Add(1)
 	writeFetchResponse(w, ackLines(terminals, fa.done), strings.NewReader(string(ingest.WritePack(objs))))
 	return true
 }
@@ -634,7 +634,7 @@ func (h *Handler) proveInClientClosure(ctx context.Context, repo string, termina
 			return true
 		}
 		visited++
-		if visited > goFetchBFSCap {
+		if visited > fastFetchBFSCap {
 			return false
 		}
 		typ, _, err := h.Cache.ObjectInfo(repo, dir, oid)
@@ -691,7 +691,7 @@ func (h *Handler) readPackAux(ctx context.Context, repo, name string) ([]byte, e
 			return nil, err
 		}
 		defer rc.Close()
-		return io.ReadAll(io.LimitReader(rc, goFetchMaxBytes+1))
+		return io.ReadAll(io.LimitReader(rc, fastFetchMaxBytes+1))
 	}
 	data, err := read()
 	if err != nil {
@@ -753,7 +753,7 @@ func writeFetchResponse(w http.ResponseWriter, ack []string, pack io.Reader) {
 			// transport error it can retry, instead of a well-framed truncated
 			// pack it reports as corruption. No trailing flush - the aborted
 			// stream is the signal.
-			slog.Warn("gofetch: pack stream error", "err", err)
+			slog.Warn("fast fetch: pack stream error", "err", err)
 			pktf(w, "\x03pack stream error\n")
 			return
 		}

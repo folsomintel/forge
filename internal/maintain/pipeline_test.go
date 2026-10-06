@@ -17,7 +17,7 @@ import (
 )
 
 // fixture is a primary with no HTTP front: a client work repo whose commits
-// are "pushed" the way goreceive does it - a self-contained pack (externals
+// are "pushed" the way the fast push path does it - a self-contained pack (externals
 // allowed, thin bases not) put to the store, a pack row, then the ref CAS.
 type fixture struct {
 	t     *testing.T
@@ -385,6 +385,40 @@ func TestWorkerConsolidatesQuietRepo(t *testing.T) {
 	f.p.scan(f.ctx)
 	if n := len(f.packNames()); n != 1 {
 		t.Fatalf("quiet repo not consolidated: %d packs", n)
+	}
+	f.assertIntact()
+}
+
+// An in-flight fast-path push holds the pack fence from its connectivity
+// proof through its ref commit; the swap must not replace the pack list
+// under it (it skips the cycle instead of blocking), and swaps normally
+// once the push is done.
+func TestSwapWaitsOutInFlightFastPush(t *testing.T) {
+	f := newFixture(t)
+	c0 := f.commit("base", map[string]string{"base.txt": "base\n"})
+	f.push("refs/heads/main", c0)
+	c1 := f.commit("c1", map[string]string{"base.txt": "c1\n"})
+	f.push("refs/heads/main", c1, c0)
+
+	defer func(d time.Duration) { fenceWait = d }(fenceWait)
+	fenceWait = 50 * time.Millisecond
+	fence := f.p.Cache.PackFence(repo)
+	f.p.afterBuild = func() { fence.RLock() }
+	res, err := f.p.Run(f.ctx, repo, 1)
+	fence.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.After != res.Before || len(f.packNames()) != 2 {
+		t.Fatalf("swapped under an in-flight push: %+v packs=%v", res, f.packNames())
+	}
+
+	f.p.afterBuild = nil
+	if _, err := f.p.Run(f.ctx, repo, 1); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.packNames()); n != 1 {
+		t.Fatalf("packs after the push finished = %d, want 1", n)
 	}
 	f.assertIntact()
 }

@@ -21,12 +21,12 @@ type UsageOut struct {
 	ActiveTransfers int64 `json:"active_transfers"`
 	// WAL exposes group-commit telemetry when the backing DB is the WAL.
 	WAL *repodb.WALStats `json:"wal,omitempty"`
-	// GoReceive exposes fork-free receive fast-path decision counts.
-	GoReceive *GoReceiveOut `json:"go_receive,omitempty"`
-	GoFetch   *GoFetchOut   `json:"go_fetch,omitempty"`
+	// FastPush exposes fork-free receive fast-path decision counts.
+	FastPush  *FastPushOut  `json:"fast_push,omitempty"`
+	FastFetch *FastFetchOut `json:"fast_fetch,omitempty"`
 }
 
-type GoFetchOut struct {
+type FastFetchOut struct {
 	Eligible     int64            `json:"eligible"`      // served entirely in Go
 	CloneStream  int64            `json:"clone_stream"`  // clones streamed straight from the store
 	ShallowClone int64            `json:"shallow_clone"` // depth-1 clones built in Go
@@ -34,7 +34,7 @@ type GoFetchOut struct {
 	FellBackBy   map[string]int64 `json:"fell_back_by,omitempty" doc:"Fallback counts by cause"`
 }
 
-type GoReceiveOut struct {
+type FastPushOut struct {
 	Eligible     int64            `json:"eligible"`
 	FellBack     int64            `json:"fell_back"`
 	Rejected     int64            `json:"rejected"`
@@ -116,13 +116,13 @@ func (s *Server) registerInstance(api huma.API) {
 				st := ws.Stats()
 				out.WAL = &st
 			}
-			if s.GoReceiveStats != nil {
-				gr := s.GoReceiveStats()
-				out.GoReceive = &gr
+			if s.FastPushStats != nil {
+				gr := s.FastPushStats()
+				out.FastPush = &gr
 			}
-			if s.GoFetchStats != nil {
-				gf := s.GoFetchStats()
-				out.GoFetch = &gf
+			if s.FastFetchStats != nil {
+				gf := s.FastFetchStats()
+				out.FastFetch = &gf
 			}
 			return &struct{ Body UsageOut }{out}, nil
 		})

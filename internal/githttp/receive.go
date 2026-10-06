@@ -35,10 +35,10 @@ import (
 // is always correct. We only ACK a push after proving we did exactly what
 // git would have.
 
-// GoReceiveStats counts fast-path decisions since boot. FellBackBy breaks
+// FastPushStats counts fast-path decisions since boot. FellBackBy breaks
 // the fallbacks down by cause, so "the fast path isn't engaging" is
 // diagnosable from telemetry alone.
-type GoReceiveStats struct {
+type FastPushStats struct {
 	Eligible     int64            `json:"eligible"`      // served entirely in Go
 	FellBack     int64            `json:"fell_back"`     // handed to git
 	Rejected     int64            `json:"rejected"`      // CAS-rejected in Go (ng)
@@ -46,7 +46,7 @@ type GoReceiveStats struct {
 	FellBackBy   map[string]int64 `json:"fell_back_by,omitempty"`
 }
 
-type goReceiveCounters struct {
+type fastPushCounters struct {
 	eligible   atomic.Int64
 	fellBack   atomic.Int64
 	rejected   atomic.Int64
@@ -63,7 +63,7 @@ type goReceiveCounters struct {
 	fbCASFallback  atomic.Int64 // non-CAS UpdateRefs error
 }
 
-func (c *goReceiveCounters) snapshot() GoReceiveStats {
+func (c *fastPushCounters) snapshot() FastPushStats {
 	by := map[string]int64{}
 	for name, v := range map[string]*atomic.Int64{
 		"oversize": &c.fbOversize, "parse": &c.fbParse, "ref_delete": &c.fbRefDelete,
@@ -75,22 +75,22 @@ func (c *goReceiveCounters) snapshot() GoReceiveStats {
 			by[name] = n
 		}
 	}
-	return GoReceiveStats{
+	return FastPushStats{
 		Eligible: c.eligible.Load(), FellBack: c.fellBack.Load(),
 		Rejected: c.rejected.Load(), StorageErred: c.storageErr.Load(),
 		FellBackBy: by,
 	}
 }
 
-// goReceiveMaxBytes caps the buffered body the fast path will consider; a
+// fastPushMaxBytes caps the buffered body the fast path will consider; a
 // larger push falls back to streaming git. Agent commits are far under it.
-const goReceiveMaxBytes = 2 << 20 // 2 MiB
+const fastPushMaxBytes = 2 << 20 // 2 MiB
 
 type pushCmd struct {
 	old, new, ref string
 }
 
-// tryGoReceive attempts to serve a receive-pack POST entirely in Go from
+// tryFastPush attempts to serve a receive-pack POST entirely in Go from
 // an already-buffered body. Returns handled=true only when the push was
 // fully processed (ACKed or ref-rejected) in Go; false means the caller
 // must fall back to git with the same body. It never returns true after a
@@ -101,10 +101,10 @@ type pushCmd struct {
 // the DB, so it can never wait behind a repack or hydration. The local
 // cache repo is materialized lazily, only when a thin-pack base or a
 // connectivity lookup actually needs it.
-func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, namespace, pusher string, body []byte) bool {
+func (h *Handler) tryFastPush(w http.ResponseWriter, r *http.Request, repo, namespace, pusher string, body []byte) bool {
 	cmds, packOff, sideband, ok := parsePktCommands(body)
 	if ok && !refsWritable(cmds, namespace) {
-		h.goRecv.fbRefName.Add(1)
+		h.pushCtr.fbRefName.Add(1)
 		return false // git refuses these with its own report
 	}
 	if ok && len(cmds) > 0 && packOff >= len(body) {
@@ -112,14 +112,14 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 		return h.tryGoDelete(w, r, repo, namespace, pusher, cmds, sideband)
 	}
 	if !ok || len(cmds) == 0 {
-		h.goRecv.fbParse.Add(1)
+		h.pushCtr.fbParse.Add(1)
 		return false // malformed: let git handle it
 	}
 	// Every command must create/update to a real OID present in this pack.
 	// (A delete mixed with updates -> git.)
 	for _, c := range cmds {
 		if c.new == zeroOID {
-			h.goRecv.fbRefDelete.Add(1)
+			h.pushCtr.fbRefDelete.Add(1)
 			return false
 		}
 	}
@@ -129,13 +129,13 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	// an arbitrary/just-deleted prefix that nothing ever sweeps (the
 	// broken-tenant leak). git's own path 404s cleanly; match it.
 	if _, err := h.DB.GetRepo(r.Context(), repo); err != nil {
-		h.goRecv.fbPack.Add(1)
+		h.pushCtr.fbPack.Add(1)
 		return false
 	}
 	// Oversize guard parity: a push git would reject via receive.maxInputSize
 	// must not sneak in through the fast path.
 	if h.MaxPushBytes > 0 && int64(len(body)-packOff) > h.MaxPushBytes {
-		h.goRecv.fbOversize.Add(1)
+		h.pushCtr.fbOversize.Add(1)
 		return false
 	}
 
@@ -184,7 +184,7 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 		return typ, data, err
 	})
 	if err != nil {
-		h.goRecv.fbPack.Add(1)
+		h.pushCtr.fbPack.Add(1)
 		return false // unresolvable base, corrupt bytes, or over caps -> git
 	}
 
@@ -194,13 +194,18 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	}
 	// Connectivity: every object reachable from each new tip must be in the
 	// pack or already in the store. Any gap -> fall back; we only proceed
-	// when we can prove full closure ourselves.
+	// when we can prove full closure ourselves. The pack fence keeps a
+	// consolidation swap from removing what we proved against until our
+	// refs are committed (and our pack is installed for its re-check).
+	fence := h.Cache.PackFence(repo)
+	fence.RLock()
+	defer fence.RUnlock()
 	connOK, externals := connectivityOK(cmds, byOID, func(oid string) bool {
 		_, _, err := lookup(oid)
 		return err == nil
 	})
 	if !connOK {
-		h.goRecv.fbConnectivity.Add(1)
+		h.pushCtr.fbConnectivity.Add(1)
 		return false
 	}
 
@@ -209,7 +214,7 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	// order as the hook path.
 	idx, err := ingest.WriteIdxV2(pack)
 	if err != nil {
-		h.goRecv.fbIdx.Add(1)
+		h.pushCtr.fbIdx.Add(1)
 		return false // idx-unrepresentable (e.g. >2GiB offset) -> git
 	}
 	name := "pack-" + hex.EncodeToString(pack.Trailer[:])
@@ -267,15 +272,15 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	}
 	if err != nil {
 		if errors.Is(err, repodb.ErrCASFailed) {
-			h.goRecv.rejected.Add(1)
+			h.pushCtr.rejected.Add(1)
 			writeReportStatus(w, sideband, cmds, err)
 			return true // a real rejection - git would do the same
 		}
 		// Transactional: nothing applied. Safe to fall back to git.
-		h.goRecv.fbCASFallback.Add(1)
+		h.pushCtr.fbCASFallback.Add(1)
 		return false
 	}
-	h.goRecv.eligible.Add(1)
+	h.pushCtr.eligible.Add(1)
 	h.recordTransitions(repo, name, cmds, externals)
 	// A workload served entirely by the fast path adds one pack per push and
 	// would never cross the consolidation threshold on its own - so clone
@@ -314,14 +319,14 @@ func (h *Handler) tryGoDelete(w http.ResponseWriter, r *http.Request, repo, name
 	ctx := r.Context()
 	repoRow, err := h.DB.GetRepo(ctx, repo)
 	if err != nil {
-		h.goRecv.fbRefDelete.Add(1)
+		h.pushCtr.fbRefDelete.Add(1)
 		return false
 	}
 	updates := make([]repodb.RefUpdate, len(cmds))
 	for i, c := range cmds {
 		if c.new != zeroOID || c.old == zeroOID || len(c.old) != 40 ||
 			(namespace == "" && c.ref == "refs/heads/"+repoRow.DefaultBranch) {
-			h.goRecv.fbRefDelete.Add(1)
+			h.pushCtr.fbRefDelete.Add(1)
 			return false
 		}
 		ref := c.ref
@@ -333,13 +338,13 @@ func (h *Handler) tryGoDelete(w http.ResponseWriter, r *http.Request, repo, name
 	if err := h.DB.UpdateRefs(ctx, repo, updates, webhook.PushEventsFor(repo, updates, pusher)); err != nil {
 		// Nothing applied either way; git re-checks and reports.
 		if errors.Is(err, repodb.ErrCASFailed) {
-			h.goRecv.fbRefDelete.Add(1)
+			h.pushCtr.fbRefDelete.Add(1)
 		} else {
-			h.goRecv.fbCASFallback.Add(1)
+			h.pushCtr.fbCASFallback.Add(1)
 		}
 		return false
 	}
-	h.goRecv.eligible.Add(1)
+	h.pushCtr.eligible.Add(1)
 	writeReportStatus(w, sideband, cmds, nil)
 	return true
 }
@@ -348,8 +353,8 @@ func (h *Handler) tryGoDelete(w http.ResponseWriter, r *http.Request, repo, name
 // errored (not because the push was unusual). git will fail on the same
 // store; surfacing this separately turns an S3 outage into a visible signal.
 func (h *Handler) storageFallback(repo, op string, err error) {
-	h.goRecv.storageErr.Add(1)
-	slog.Warn("goreceive: store error, falling back to git", "repo", repo, "op", op, "err", err)
+	h.pushCtr.storageErr.Add(1)
+	slog.Warn("fast push: store error, falling back to git", "repo", repo, "op", op, "err", err)
 }
 
 // connectivityOK walks each new tip's object closure. Objects in the pack

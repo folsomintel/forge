@@ -169,12 +169,12 @@ func Build(cfg config.Config) (*Server, error) {
 		// Remote reader: serve big repos' pack data from the bucket in blocks.
 		// Requires the Go-native serve paths - a forked git upload-pack on a
 		// repo whose .pack isn't local would abort ("repository corruption") -
-		// so force GoFetch on. Remote placement only applies to replicas.
+		// so force FastFetch on. Remote placement only applies to replicas.
 		cache.RemoteBytes = cfg.RemotePlacementBytes
 		cache.Blocks = packstore.NewCache(cfg.BlockCacheBytes)
-		if !cfg.GoFetch {
-			cfg.GoFetch = true
-			slog.Info("remote placement forces GoFetch on (Go-native clone serving)")
+		if !cfg.FastFetch {
+			cfg.FastFetch = true
+			slog.Info("remote placement forces FastFetch on (Go-native clone serving)")
 		}
 		slog.Info("remote pack placement enabled", "threshold_bytes", cfg.RemotePlacementBytes, "block_cache_bytes", cfg.BlockCacheBytes)
 	}
@@ -229,9 +229,9 @@ func Build(cfg config.Config) (*Server, error) {
 	gh := &githttp.Handler{
 		Cache: cache, DB: db, Blobs: blobs, Bundles: pipeline, Stager: stager, Auth: verifier,
 		HooksDir: cfg.HooksDir(), SelfPath: self, HookEnv: hookEnv, Limit: gitLimit,
-		MaxPushBytes: cfg.MaxPushBytes, GoReceive: cfg.GoReceive,
+		MaxPushBytes: cfg.MaxPushBytes, FastPush: cfg.FastPush,
 		MaxGitForks: cfg.MaxGitForks, ForkAdvertisement: cfg.ForkAdvertisement,
-		GoFetch: cfg.GoFetch,
+		FastFetch: cfg.FastFetch,
 		NudgeMaintain: func(repo string) {
 			pipeline.NudgeIfNeeded(context.Background(), repo)
 		},
@@ -250,23 +250,23 @@ func Build(cfg config.Config) (*Server, error) {
 		}
 		hub.Publish(evs...)
 	}
-	goRecvStats := func() api.GoReceiveOut {
-		s := gh.GoReceiveStats()
-		return api.GoReceiveOut{
+	fastPushStats := func() api.FastPushOut {
+		s := gh.FastPushStats()
+		return api.FastPushOut{
 			Eligible: s.Eligible, FellBack: s.FellBack, Rejected: s.Rejected,
 			StorageErred: s.StorageErred, FellBackBy: s.FellBackBy,
 		}
 	}
-	goFetchStats := func() api.GoFetchOut {
-		s := gh.GoFetchStatsSnapshot()
-		return api.GoFetchOut{
+	fastFetchStats := func() api.FastFetchOut {
+		s := gh.FastFetchStatsSnapshot()
+		return api.FastFetchOut{
 			Eligible: s.Eligible, CloneStream: s.CloneStream, ShallowClone: s.ShallowClone,
 			FellBack: s.FellBack, FellBackBy: s.FellBackBy,
 		}
 	}
 	(&api.Server{DB: db, Auth: verifier, Cache: cache, Ingest: svc,
 		Maintain: pipeline, Limit: apiLimit, ActiveTransfers: gh.ActiveTransfers,
-		GoReceiveStats: goRecvStats, GoFetchStats: goFetchStats, Events: hub}).Register(mux)
+		FastPushStats: fastPushStats, FastFetchStats: fastFetchStats, Events: hub}).Register(mux)
 	// Liveness: the process is up. Never fails while we can answer, so a
 	// draining machine still reports healthz ok (it is alive, just closing).
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {

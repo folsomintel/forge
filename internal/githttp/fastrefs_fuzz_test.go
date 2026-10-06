@@ -50,7 +50,7 @@ func FuzzGoUploadPackCommand(f *testing.F) {
 		{Name: "refs/heads/main", Old: repodb.ZeroOID, New: "1111111111111111111111111111111111111111"},
 		{Name: "refs/tags/v1", Old: repodb.ZeroOID, New: "2222222222222222222222222222222222222222"},
 	}, nil, nil, 1)
-	h := &Handler{DB: db, Cache: repocache.New(f.TempDir(), db, nil), GoFetch: true}
+	h := &Handler{DB: db, Cache: repocache.New(f.TempDir(), db, nil), FastFetch: true}
 
 	// Seeds: a real ls-refs body, bundle-uri, and junk.
 	var lsRefs []byte
@@ -84,7 +84,7 @@ func FuzzGoUploadPackCommand(f *testing.F) {
 	f.Fuzz(func(t *testing.T, body []byte) {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", "/fz.git/git-upload-pack", nil)
-		handled := h.goUploadPackCommand(rec, req, "fz", "", body)
+		handled := h.fastUploadPackCommand(rec, req, "fz", "", body)
 		if handled && rec.Body.Len() == 0 {
 			t.Fatal("handled a command but wrote nothing")
 		}
@@ -106,7 +106,7 @@ var fuzzStore struct {
 }
 
 func fuzzStoreDir() string {
-	fuzzStore.once.Do(func() { fuzzStore.dir, _ = os.MkdirTemp("", "goadv-fuzz-store-*") })
+	fuzzStore.once.Do(func() { fuzzStore.dir, _ = os.MkdirTemp("", "fastrefs-fuzz-store-*") })
 	return fuzzStore.dir
 }
 

@@ -58,7 +58,7 @@ func TestRemotePlacementReplicaServesFromBucket(t *testing.T) {
 		Replica:              true,
 		RemotePlacementBytes: 1,       // any repo with packs is "big"
 		BlockCacheBytes:      8 << 20, // small block LRU
-		GoFetch:              true,    // remote placement serves clones via gofetch
+		FastFetch:            true,    // remote placement serves clones via fast fetch
 		WebhookAllowPrivate:  true,
 	}
 	srv2, err := server.Build(cfg2)
@@ -132,7 +132,7 @@ func TestRemotePlacementReplicaServesFromBucket(t *testing.T) {
 		t.Fatalf("replica commit read: HTTP %d", cResp.StatusCode)
 	}
 
-	// And a clone from the replica works (gofetch streams the gc pack from the
+	// And a clone from the replica works (fast fetch streams the gc pack from the
 	// bucket; no local .pack needed).
 	clone := filepath.Join(dir2, "cloned")
 	remote := "http://t:" + e.token + "@" + ln.Addr().String() + "/big.git"

@@ -368,8 +368,16 @@ func (p *Pipeline) swapConsolidated(ctx context.Context, st *RepoState, oldPacks
 		slog.Info("consolidate: swap", "repo", st.RepoID, "lock_held", time.Since(locked),
 			"swapped", ok, "superseded", len(oldNames))
 	}()
-	// The write lock excludes git-path pushes and materializations, but
-	// goreceive pushes stay lock-free: re-prove against the refs as of now.
+	// The write lock excludes git-path pushes and materializations; the
+	// pack fence excludes in-flight fast-path pushes, which may be waiting
+	// on this lock while holding the fence - so never block on it here.
+	fence := p.Cache.PackFence(st.RepoID)
+	if !tryLockFor(fence, fenceWait) {
+		slog.Info("consolidate: pushes in flight, retrying next cycle", "repo", st.RepoID)
+		return nil, false, nil
+	}
+	defer fence.Unlock()
+	// Fast-path pushes that committed since the build: re-prove now.
 	if err := cov.check(ctx); err != nil {
 		slog.Info("consolidate: moved ref not covered, retrying next cycle", "repo", st.RepoID, "err", err)
 		return nil, false, nil
@@ -393,6 +401,24 @@ func (p *Pipeline) swapConsolidated(ctx context.Context, st *RepoState, oldPacks
 	}
 	os.Remove(filepath.Join(packDir, "multi-pack-index"))
 	return ownedOld, true, nil
+}
+
+// fenceWait bounds how long a swap waits for in-flight fast-path pushes.
+var fenceWait = 2 * time.Second
+
+// tryLockFor takes l exclusively within d, without queueing as a writer
+// (a queued writer would stall new readers behind it).
+func tryLockFor(l *sync.RWMutex, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if l.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // deleteSuperseded deletes the store blobs of packs a committed swap took
