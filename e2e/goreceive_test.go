@@ -1,8 +1,15 @@
 package e2e
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"io/fs"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/folsomintel/forge/internal/config"
@@ -99,5 +106,69 @@ func TestGoReceiveDeleteOnlyPush(t *testing.T) {
 	after = e.srv.GitHTTP.GoReceiveStats()
 	if after.Eligible != before.Eligible || after.FellBackBy["ref_delete"] <= before.FellBackBy["ref_delete"] {
 		t.Fatalf("default-branch delete must go to git: before=%+v after=%+v", before, after)
+	}
+}
+
+// A crafted push with a ref name git refuses must never be stored: ref
+// names become cache file paths, and refs/heads/../../x once escaped the
+// repo directory. The normal view also may not write hidden namespace refs.
+func TestGoReceiveRejectsFunnyAndHiddenRefs(t *testing.T) {
+	t.Parallel()
+	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e.createRepo("funny")
+
+	work := filepath.Join(e.dir, "work")
+	e.git(e.dir, "clone", e.remote("funny", ""), work)
+	os.WriteFile(filepath.Join(work, "a.txt"), []byte("a\n"), 0o644)
+	e.git(work, "add", ".")
+	e.git(work, "commit", "-q", "-m", "base")
+	e.git(work, "push", "-q", "origin", "HEAD:main")
+
+	// Raw receive-pack request (real git clients refuse to send these).
+	blob := strings.TrimSpace(e.git(work, "hash-object", "-w", "a.txt"))
+	pack := exec.Command("git", "pack-objects", "-q", "--stdout")
+	pack.Dir = work
+	pack.Stdin = strings.NewReader(blob + "\n")
+	packBytes, err := pack.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []string{"refs/heads/../../../escaped", "refs/heads/.hidden", "HEAD"} {
+		line := fmt.Sprintf("%s %s %s\x00report-status\n", strings.Repeat("0", 40), blob, ref)
+		body := append([]byte(fmt.Sprintf("%04x%s0000", len(line)+4, line)), packBytes...)
+		req, _ := http.NewRequest("POST", e.base+"/funny.git/git-receive-pack", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+e.token)
+		req.Header.Set("Content-Type", "application/x-git-receive-pack-request")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if strings.Contains(string(out), "ok "+ref) {
+			t.Errorf("push of %q was accepted: %q", ref, out)
+		}
+	}
+	if out := e.git(work, "ls-remote", "origin"); strings.Contains(out, "escaped") || strings.Contains(out, ".hidden") {
+		t.Fatalf("funny ref stored:\n%s", out)
+	}
+	// A read materializes the cache; nothing may land outside refs/.
+	e.git(e.dir, "clone", "-q", e.remote("funny", ""), filepath.Join(e.dir, "verify"))
+	filepath.WalkDir(e.dir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.Name() == "escaped" {
+			t.Errorf("ref name escaped the repo dir: %s", path)
+		}
+		return nil
+	})
+
+	// The normal view must not create hidden (ephemeral namespace) refs.
+	if out, err := e.gitErr(work, "push", "origin", "HEAD:refs/namespaces/x/refs/heads/sneaky"); err == nil {
+		t.Fatalf("normal-view push into refs/namespaces succeeded:\n%s", out)
+	}
+	if out := e.git(work, "ls-remote", e.remote("funny", "+ephemeral")); strings.Contains(out, "sneaky") {
+		t.Fatalf("hidden ref created from the normal view:\n%s", out)
+	}
+	if by := e.srv.GitHTTP.GoReceiveStats().FellBackBy; by["ref_name"] < 4 {
+		t.Fatalf("funny/hidden refs should fall back on ref_name: %v", by)
 	}
 }

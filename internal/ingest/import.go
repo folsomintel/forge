@@ -131,7 +131,15 @@ func (s *Service) runImport(ctx context.Context, repoID, url string) (int, error
 	// all-or-nothing ref CAS (fails if any target ref already exists).
 	updates := make([]repodb.RefUpdate, 0, len(refs))
 	for _, r := range refs {
+		// A bundle lists HEAD alongside its refs; like clone, take only
+		// refs/* (HEAD is the repo's symref, set from default_branch).
+		if !strings.HasPrefix(r.Name, "refs/") {
+			continue
+		}
 		updates = append(updates, repodb.RefUpdate{Name: r.Name, Old: repodb.ZeroOID, New: r.Target})
+	}
+	if len(updates) == 0 {
+		return 0, fmt.Errorf("bundle contains no refs")
 	}
 	if err := Apply(ctx, s.DB, s.Blobs, repoID, "import", updates, qdir, nil); err != nil {
 		if errors.Is(err, repodb.ErrCASFailed) {

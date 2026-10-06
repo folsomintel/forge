@@ -56,6 +56,7 @@ type goReceiveCounters struct {
 	fbOversize     atomic.Int64 // body exceeded the buffer cap
 	fbParse        atomic.Int64 // malformed pkt-lines
 	fbRefDelete    atomic.Int64 // ref deletion (git handles those)
+	fbRefName      atomic.Int64 // ref name git refuses (funny or hidden)
 	fbPack         atomic.Int64 // unresolvable pack (bad bytes, missing base)
 	fbConnectivity atomic.Int64 // object closure not provable
 	fbIdx          atomic.Int64 // idx-unrepresentable
@@ -66,7 +67,8 @@ func (c *goReceiveCounters) snapshot() GoReceiveStats {
 	by := map[string]int64{}
 	for name, v := range map[string]*atomic.Int64{
 		"oversize": &c.fbOversize, "parse": &c.fbParse, "ref_delete": &c.fbRefDelete,
-		"pack": &c.fbPack, "connectivity": &c.fbConnectivity, "idx": &c.fbIdx,
+		"ref_name": &c.fbRefName,
+		"pack":     &c.fbPack, "connectivity": &c.fbConnectivity, "idx": &c.fbIdx,
 		"storage": &c.storageErr, "update_refs": &c.fbCASFallback,
 	} {
 		if n := v.Load(); n > 0 {
@@ -101,6 +103,10 @@ type pushCmd struct {
 // connectivity lookup actually needs it.
 func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, namespace, pusher string, body []byte) bool {
 	cmds, packOff, sideband, ok := parsePktCommands(body)
+	if ok && !refsWritable(cmds, namespace) {
+		h.goRecv.fbRefName.Add(1)
+		return false // git refuses these with its own report
+	}
 	if ok && len(cmds) > 0 && packOff >= len(body) {
 		// No pack follows: an all-delete push (git sends a pack otherwise).
 		return h.tryGoDelete(w, r, repo, namespace, pusher, cmds, sideband)
@@ -282,6 +288,20 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 			f.Flush()
 		}
 		h.NudgeMaintain(repo)
+	}
+	return true
+}
+
+// refsWritable mirrors the ref checks git receive-pack makes before any
+// update: every name must pass check-ref-format ("funny refname"), and the
+// normal view may not touch refs hidden by transfer.hideRefs (the
+// ephemeral namespace). Names become cache file paths, so this is also
+// what keeps a crafted name from escaping the repo directory.
+func refsWritable(cmds []pushCmd, namespace string) bool {
+	for _, c := range cmds {
+		if !repodb.ValidRefName(c.ref) || (namespace == "" && strings.HasPrefix(c.ref, "refs/namespaces/")) {
+			return false
+		}
 	}
 	return true
 }

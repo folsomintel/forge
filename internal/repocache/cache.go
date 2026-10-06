@@ -503,6 +503,13 @@ func (c *Cache) SyncRefs(ctx context.Context, repoID, dir string) error {
 		return err
 	}
 	for _, r := range refs {
+		// Names become paths below dir. The store rejects bad names on write;
+		// this also covers any stored before it did (e.g. refs/heads/../../x
+		// would otherwise be written outside the repo).
+		if !repodb.ValidRefName(r.Name) {
+			slog.Warn("sync refs: skipping invalid ref name", "repo", repoID, "ref", r.Name)
+			continue
+		}
 		want[r.Name] = r.Target
 	}
 

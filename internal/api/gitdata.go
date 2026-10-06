@@ -211,17 +211,6 @@ func refErr(err error) error {
 	}
 }
 
-// validRefName is a conservative subset of git-check-ref-format.
-func validRefName(name string) bool {
-	if !strings.HasPrefix(name, "refs/") || strings.HasSuffix(name, "/") ||
-		strings.HasSuffix(name, ".lock") || strings.Contains(name, "..") ||
-		strings.Contains(name, "//") || strings.Contains(name, "@{") {
-		return false
-	}
-	for _, c := range name {
-		if c < 0x20 || c == 0x7f || strings.ContainsRune(" ~^:?*[\\", c) {
-			return false
-		}
-	}
-	return true
-}
+// validRefName is repodb's git-check-ref-format check (the store enforces
+// it too; checking here turns a bad name into a 422 instead of a 500).
+func validRefName(name string) bool { return repodb.ValidRefName(name) }

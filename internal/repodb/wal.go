@@ -221,6 +221,11 @@ func (w *WAL) updateRefs(ctx context.Context, repoID string, updates []RefUpdate
 	if events != nil && len(events) != len(updates) {
 		return fmt.Errorf("events must be nil or match updates (%d vs %d)", len(events), len(updates))
 	}
+	for _, u := range updates {
+		if !ValidRefName(u.Name) {
+			return fmt.Errorf("%w: %q", ErrInvalidRef, u.Name)
+		}
+	}
 	if _, err := w.SQLite.GetRepo(ctx, repoID); err != nil {
 		return err
 	}

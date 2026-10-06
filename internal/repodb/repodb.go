@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -17,9 +18,36 @@ var (
 	ErrNotFound  = errors.New("not found")
 	ErrExists    = errors.New("already exists")
 	ErrCASFailed = errors.New("ref update conflict")
+	// ErrInvalidRef: a ref name git itself would refuse. Ref names become
+	// loose-ref paths in the cache, so this is a path-safety check too.
+	ErrInvalidRef = errors.New("invalid ref name")
 )
 
 var repoIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
+
+// ValidRefName is git-check-ref-format for a full ref name under refs/:
+// no "..", no component starting with "." or ending in ".lock", no "//",
+// no trailing "/" or ".", no "@{", no control or special characters.
+// Every ref write is checked against it - the cache turns names into
+// file paths, so a name like refs/heads/../../x must never be stored.
+func ValidRefName(name string) bool {
+	rest, ok := strings.CutPrefix(name, "refs/")
+	if !ok || rest == "" || strings.HasSuffix(name, ".") ||
+		strings.Contains(name, "..") || strings.Contains(name, "@{") {
+		return false
+	}
+	for _, comp := range strings.Split(rest, "/") {
+		if comp == "" || strings.HasPrefix(comp, ".") || strings.HasSuffix(comp, ".lock") {
+			return false
+		}
+	}
+	for _, c := range name {
+		if c < 0x20 || c == 0x7f || strings.ContainsRune(" ~^:?*[\\", c) {
+			return false
+		}
+	}
+	return true
+}
 
 // ValidRepoID rejects anything that could escape a path or confuse a URL.
 func ValidRepoID(id string) bool {
