@@ -65,3 +65,39 @@ func TestGoReceiveHandlesRealGitPushes(t *testing.T) {
 		t.Logf("fsck output: %s", out)
 	}
 }
+
+// Branch cleanup (an all-delete push carries no pack) is served in Go; a
+// delete of the default branch still goes to git, which refuses it.
+func TestGoReceiveDeleteOnlyPush(t *testing.T) {
+	t.Parallel()
+	e := startServerWith(t, func(cfg *config.Config) { cfg.GoReceive = true })
+	e.createRepo("del")
+
+	work := filepath.Join(e.dir, "work")
+	e.git(e.dir, "clone", e.remote("del", ""), work)
+	e.git(work, "config", "user.email", "t@example.com")
+	e.git(work, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(work, "a.txt"), []byte("a\n"), 0o644)
+	e.git(work, "add", ".")
+	e.git(work, "commit", "-q", "-m", "base")
+	e.git(work, "push", "-q", "origin", "HEAD:main", "HEAD:refs/heads/scratch-1", "HEAD:refs/heads/scratch-2")
+
+	before := e.srv.GitHTTP.GoReceiveStats()
+	e.git(work, "push", "-q", "origin", "--delete", "scratch-1", "scratch-2")
+	after := e.srv.GitHTTP.GoReceiveStats()
+	if after.Eligible != before.Eligible+1 || after.FellBack != before.FellBack {
+		t.Fatalf("delete-only push left the fast path: before=%+v after=%+v", before, after)
+	}
+	if out := e.git(work, "ls-remote", "origin", "refs/heads/scratch-*"); out != "" {
+		t.Fatalf("branches survived delete: %q", out)
+	}
+
+	before = after
+	if _, err := e.gitErr(work, "push", "-q", "origin", "--delete", "main"); err == nil {
+		t.Logf("git accepted deleting the default branch (bare repo)")
+	}
+	after = e.srv.GitHTTP.GoReceiveStats()
+	if after.Eligible != before.Eligible || after.FellBackBy["ref_delete"] <= before.FellBackBy["ref_delete"] {
+		t.Fatalf("default-branch delete must go to git: before=%+v after=%+v", before, after)
+	}
+}

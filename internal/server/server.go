@@ -183,6 +183,8 @@ func Build(cfg config.Config) (*Server, error) {
 		PublicURL:    strings.TrimSuffix(cfg.PublicURL, "/"),
 		BundleSecret: bundleSecret,
 		MinPacks:     cfg.MaintainMinPacks,
+		MinInterval:  cfg.MaintainMinInterval,
+		QuietAfter:   cfg.MaintainQuietAfter,
 		BuildHistory: cfg.BuildHistoryPack,
 	}
 	cache.Hydrate = pipeline.Hydrate
@@ -258,7 +260,7 @@ func Build(cfg config.Config) (*Server, error) {
 	goFetchStats := func() api.GoFetchOut {
 		s := gh.GoFetchStatsSnapshot()
 		return api.GoFetchOut{
-			Eligible: s.Eligible, CloneStream: s.CloneStream,
+			Eligible: s.Eligible, CloneStream: s.CloneStream, ShallowClone: s.ShallowClone,
 			FellBack: s.FellBack, FellBackBy: s.FellBackBy,
 		}
 	}

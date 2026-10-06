@@ -308,7 +308,11 @@ func (h *Handler) service(w http.ResponseWriter, r *http.Request, service string
 	if !ok {
 		return
 	}
-	lock.RLock()
+	if !rlockCtx(r.Context(), lock) {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "server busy - retry", http.StatusServiceUnavailable)
+		return
+	}
 	defer lock.RUnlock()
 
 	// Staged tee: upload the wire pack to the store WHILE the client is
@@ -342,6 +346,33 @@ func (h *Handler) materialize(w http.ResponseWriter, r *http.Request, repo strin
 		return "", false
 	}
 	return dir, true
+}
+
+// rlockCtx takes the repo read lock, giving up when the request ends or
+// the fork gate's 15s queue budget elapses. A bare RLock parks forever
+// behind a long-held write lock (and RWMutex blocks new readers once a
+// writer waits) - one slow maintenance swap became minutes of hung
+// clients with no error anywhere.
+func rlockCtx(ctx context.Context, l *sync.RWMutex) bool {
+	if l.TryRLock() {
+		return true
+	}
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return false
+		case <-tick.C:
+			if l.TryRLock() {
+				return true
+			}
+		}
+	}
 }
 
 // acquireFork blocks until a fork slot is free (bounding concurrent git

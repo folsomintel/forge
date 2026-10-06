@@ -27,10 +27,11 @@ type UsageOut struct {
 }
 
 type GoFetchOut struct {
-	Eligible    int64            `json:"eligible"`     // served entirely in Go
-	CloneStream int64            `json:"clone_stream"` // clones streamed straight from the store
-	FellBack    int64            `json:"fell_back"`    // handed to git
-	FellBackBy  map[string]int64 `json:"fell_back_by,omitempty" doc:"Fallback counts by cause"`
+	Eligible     int64            `json:"eligible"`      // served entirely in Go
+	CloneStream  int64            `json:"clone_stream"`  // clones streamed straight from the store
+	ShallowClone int64            `json:"shallow_clone"` // depth-1 clones built in Go
+	FellBack     int64            `json:"fell_back"`     // handed to git
+	FellBackBy   map[string]int64 `json:"fell_back_by,omitempty" doc:"Fallback counts by cause"`
 }
 
 type GoReceiveOut struct {

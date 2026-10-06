@@ -302,3 +302,122 @@ func TestGoFetchNamespaceIsolation(t *testing.T) {
 		t.Fatal("secret file present in normal clone")
 	}
 }
+
+// Depth-1 clone (the agent checkout): served in Go from the tip's tree
+// closure, with the tip recorded as the shallow boundary.
+func TestGoFetchShallowClone(t *testing.T) {
+	t.Parallel()
+	e := goFetchEnv(t)
+	e.createRepo("shal")
+
+	work := filepath.Join(e.dir, "work")
+	e.git(e.dir, "clone", e.remote("shal", ""), work)
+	e.git(work, "config", "user.email", "t@example.com")
+	e.git(work, "config", "user.name", "t")
+	os.MkdirAll(filepath.Join(work, "src", "deep"), 0o755)
+	for i := 0; i < 3; i++ {
+		os.WriteFile(filepath.Join(work, "f.txt"), []byte(fmt.Sprintf("v%d\n", i)), 0o644)
+		os.WriteFile(filepath.Join(work, "src", "deep", "g.txt"), []byte(fmt.Sprintf("g%d\n", i)), 0o644)
+		e.git(work, "add", ".")
+		e.git(work, "commit", "-q", "-m", fmt.Sprintf("c%d", i))
+		e.git(work, "push", "-q", "origin", "HEAD:main")
+	}
+
+	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	clone := filepath.Join(e.dir, "clone")
+	e.git(e.dir, "clone", "-q", "--depth", "1", e.remote("shal", ""), clone)
+	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+
+	if after.ShallowClone <= before.ShallowClone {
+		t.Fatalf("depth-1 clone did not use the fast path: before=%+v after=%+v", before, after)
+	}
+	for path, want := range map[string]string{"f.txt": "v2\n", "src/deep/g.txt": "g2\n"} {
+		if got, err := os.ReadFile(filepath.Join(clone, path)); err != nil || string(got) != want {
+			t.Fatalf("%s = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	if got := strings.TrimSpace(e.git(clone, "rev-parse", "--is-shallow-repository")); got != "true" {
+		t.Fatalf("is-shallow-repository = %q, want true", got)
+	}
+	if got := strings.TrimSpace(e.git(clone, "rev-list", "--count", "HEAD")); got != "1" {
+		t.Fatalf("history length = %s, want 1", got)
+	}
+	e.git(clone, "fsck", "--strict")
+
+	// The shallow clone pushes on top (the agent session loop); its
+	// "shallow" preamble must not knock the push off goreceive.
+	e.git(clone, "config", "user.email", "t@example.com")
+	e.git(clone, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(clone, "f.txt"), []byte("v3\n"), 0o644)
+	e.git(clone, "commit", "-q", "-am", "c3")
+	recvBefore := e.srv.GitHTTP.GoReceiveStats()
+	e.git(clone, "push", "-q", "origin", "HEAD:main")
+	recvAfter := e.srv.GitHTTP.GoReceiveStats()
+	if recvAfter.Eligible <= recvBefore.Eligible || recvAfter.FellBack != recvBefore.FellBack {
+		t.Fatalf("shallow push left goreceive: before=%+v after=%+v", recvBefore, recvAfter)
+	}
+	got, err := e.gitErr(e.dir, "ls-remote", e.remote("shal", ""), "refs/heads/main")
+	if err != nil || !strings.HasPrefix(got, strings.TrimSpace(e.git(clone, "rev-parse", "HEAD"))) {
+		t.Fatalf("main after shallow push = %q, %v", got, err)
+	}
+}
+
+// A root-commit tip has no boundary: the depth-1 clone is complete.
+func TestGoFetchShallowCloneRootCommit(t *testing.T) {
+	t.Parallel()
+	e := goFetchEnv(t)
+	e.createRepo("root")
+
+	work := filepath.Join(e.dir, "work")
+	e.git(e.dir, "clone", e.remote("root", ""), work)
+	e.git(work, "config", "user.email", "t@example.com")
+	e.git(work, "config", "user.name", "t")
+	os.WriteFile(filepath.Join(work, "f.txt"), []byte("only\n"), 0o644)
+	e.git(work, "add", ".")
+	e.git(work, "commit", "-q", "-m", "root")
+	e.git(work, "push", "-q", "origin", "HEAD:main")
+
+	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	clone := filepath.Join(e.dir, "clone")
+	e.git(e.dir, "clone", "-q", "--depth", "1", e.remote("root", ""), clone)
+	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+
+	if after.ShallowClone <= before.ShallowClone {
+		t.Fatalf("depth-1 clone did not use the fast path: before=%+v after=%+v", before, after)
+	}
+	if got := strings.TrimSpace(e.git(clone, "rev-parse", "--is-shallow-repository")); got != "false" {
+		t.Fatalf("is-shallow-repository = %q, want false", got)
+	}
+	e.git(clone, "fsck", "--strict")
+}
+
+// Deeper histories need git's boundary negotiation: --depth 2 falls back
+// and is still correct.
+func TestGoFetchShallowDepth2FallsBack(t *testing.T) {
+	t.Parallel()
+	e := goFetchEnv(t)
+	e.createRepo("d2")
+
+	work := filepath.Join(e.dir, "work")
+	e.git(e.dir, "clone", e.remote("d2", ""), work)
+	e.git(work, "config", "user.email", "t@example.com")
+	e.git(work, "config", "user.name", "t")
+	for i := 0; i < 3; i++ {
+		os.WriteFile(filepath.Join(work, "f.txt"), []byte(fmt.Sprintf("v%d\n", i)), 0o644)
+		e.git(work, "add", ".")
+		e.git(work, "commit", "-q", "-m", fmt.Sprintf("c%d", i))
+		e.git(work, "push", "-q", "origin", "HEAD:main")
+	}
+
+	before := e.srv.GitHTTP.GoFetchStatsSnapshot()
+	clone := filepath.Join(e.dir, "clone")
+	e.git(e.dir, "clone", "-q", "--depth", "2", e.remote("d2", ""), clone)
+	after := e.srv.GitHTTP.GoFetchStatsSnapshot()
+
+	if after.ShallowClone != before.ShallowClone || after.FellBackBy["args"] <= before.FellBackBy["args"] {
+		t.Fatalf("depth 2 should fall back on args: before=%+v after=%+v", before, after)
+	}
+	if got := strings.TrimSpace(e.git(clone, "rev-list", "--count", "HEAD")); got != "2" {
+		t.Fatalf("history length = %s, want 2", got)
+	}
+}

@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/folsomintel/forge/internal/ingest"
@@ -102,12 +101,16 @@ type pushCmd struct {
 // connectivity lookup actually needs it.
 func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, namespace, pusher string, body []byte) bool {
 	cmds, packOff, sideband, ok := parsePktCommands(body)
-	if !ok || len(cmds) == 0 || packOff >= len(body) {
+	if ok && len(cmds) > 0 && packOff >= len(body) {
+		// No pack follows: an all-delete push (git sends a pack otherwise).
+		return h.tryGoDelete(w, r, repo, namespace, pusher, cmds, sideband)
+	}
+	if !ok || len(cmds) == 0 {
 		h.goRecv.fbParse.Add(1)
-		return false // malformed, or ref-only (delete): let git handle it
+		return false // malformed: let git handle it
 	}
 	// Every command must create/update to a real OID present in this pack.
-	// (Deletes -> git; they carry no pack and want the same report plumbing.)
+	// (A delete mixed with updates -> git.)
 	for _, c := range cmds {
 		if c.new == zeroOID {
 			h.goRecv.fbRefDelete.Add(1)
@@ -130,13 +133,36 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 		return false
 	}
 
-	// Lazy materialization: resolved at most once, on first need.
+	// Out-of-pack object lookups (a parent commit, unchanged blobs, thin
+	// bases). The already-materialized cache answers almost all of them -
+	// installPack keeps it current with this node's pushes, and cat-file
+	// rescans packs on a miss - so a full MaterializeServe (which every
+	// push's token move would otherwise force) runs only on a miss.
 	var dir string
 	var dirErr error
-	var dirOnce sync.Once
-	lazyDir := func() (string, error) {
-		dirOnce.Do(func() { dir, dirErr = h.Cache.MaterializeServe(r.Context(), repo) })
-		return dir, dirErr
+	synced := false
+	lookup := func(oid string) (string, string, error) {
+		if dir == "" && !synced {
+			if d, ok := h.Cache.DirIfMaterialized(repo); ok {
+				dir = d
+			}
+		}
+		for {
+			if dir == "" || dirErr != nil {
+				if synced {
+					return "", "", dirErr
+				}
+				synced = true
+				dir, dirErr = h.Cache.MaterializeServe(r.Context(), repo)
+				continue
+			}
+			typ, _, err := h.Cache.ObjectInfo(repo, dir, oid)
+			if err == nil || synced {
+				return dir, typ, err
+			}
+			synced = true
+			dir, dirErr = h.Cache.MaterializeServe(r.Context(), repo)
+		}
 	}
 
 	// Parse and resolve the pack, including thin-pack REF_DELTA bases
@@ -144,11 +170,7 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	// (bases appended, trailer recomputed) so what we store is always
 	// self-contained.
 	pack, packBytes, err := ingest.ReadPackThin(body[packOff:], func(oid string) (string, []byte, error) {
-		d, err := lazyDir()
-		if err != nil {
-			return "", nil, err
-		}
-		typ, _, err := h.Cache.ObjectInfo(repo, d, oid)
+		d, typ, err := lookup(oid)
 		if err != nil {
 			return "", nil, err
 		}
@@ -167,7 +189,10 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	// Connectivity: every object reachable from each new tip must be in the
 	// pack or already in the store. Any gap -> fall back; we only proceed
 	// when we can prove full closure ourselves.
-	connOK, externals := h.connectivityOK(r.Context(), repo, lazyDir, cmds, byOID)
+	connOK, externals := connectivityOK(cmds, byOID, func(oid string) bool {
+		_, _, err := lookup(oid)
+		return err == nil
+	})
 	if !connOK {
 		h.goRecv.fbConnectivity.Add(1)
 		return false
@@ -249,10 +274,52 @@ func (h *Handler) tryGoReceive(w http.ResponseWriter, r *http.Request, repo, nam
 	// A workload served entirely by the fast path adds one pack per push and
 	// would never cross the consolidation threshold on its own - so clone
 	// passthrough (which needs a single gc pack) could never engage. Nudge
-	// maintenance like the hook path does.
+	// maintenance like the hook path does - after the ack is on the wire, so
+	// the nudge's pack listing never sits on the push latency.
+	writeReportStatus(w, sideband, cmds, nil)
 	if h.NudgeMaintain != nil {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 		h.NudgeMaintain(repo)
 	}
+	return true
+}
+
+// tryGoDelete serves an all-delete push (the agent's branch cleanup): a
+// ref-only CAS to zero through the same WAL commit, no pack, no fork.
+// Deleting the default branch, or any CAS miss, goes to git so its
+// refusal and error reporting stay exactly git's.
+func (h *Handler) tryGoDelete(w http.ResponseWriter, r *http.Request, repo, namespace, pusher string, cmds []pushCmd, sideband bool) bool {
+	ctx := r.Context()
+	repoRow, err := h.DB.GetRepo(ctx, repo)
+	if err != nil {
+		h.goRecv.fbRefDelete.Add(1)
+		return false
+	}
+	updates := make([]repodb.RefUpdate, len(cmds))
+	for i, c := range cmds {
+		if c.new != zeroOID || c.old == zeroOID || len(c.old) != 40 ||
+			(namespace == "" && c.ref == "refs/heads/"+repoRow.DefaultBranch) {
+			h.goRecv.fbRefDelete.Add(1)
+			return false
+		}
+		ref := c.ref
+		if namespace != "" {
+			ref = "refs/namespaces/" + namespace + "/" + ref
+		}
+		updates[i] = repodb.RefUpdate{Name: ref, Old: c.old, New: c.new}
+	}
+	if err := h.DB.UpdateRefs(ctx, repo, updates, webhook.PushEventsFor(repo, updates, pusher)); err != nil {
+		// Nothing applied either way; git re-checks and reports.
+		if errors.Is(err, repodb.ErrCASFailed) {
+			h.goRecv.fbRefDelete.Add(1)
+		} else {
+			h.goRecv.fbCASFallback.Add(1)
+		}
+		return false
+	}
+	h.goRecv.eligible.Add(1)
 	writeReportStatus(w, sideband, cmds, nil)
 	return true
 }
@@ -268,11 +335,10 @@ func (h *Handler) storageFallback(repo, op string, err error) {
 // connectivityOK walks each new tip's object closure. Objects in the pack
 // are parsed and their references enqueued; objects already in the store
 // are accepted without recursion (the store's closure is self-consistent).
-// A referenced object in neither place fails the check. The cache repo is
-// materialized (via lazyDir) only if an out-of-pack lookup is needed.
-// The returned externals list (out-of-pack objects the closure touched)
-// feeds the fetch fast path's transition record.
-func (h *Handler) connectivityOK(ctx context.Context, repo string, lazyDir func() (string, error), cmds []pushCmd, byOID map[string]ingest.PackObject) (bool, []string) {
+// A referenced object in neither place fails the check; inStore answers
+// the out-of-pack lookups. The returned externals list (out-of-pack
+// objects the closure touched) feeds the fetch fast path's transition record.
+func connectivityOK(cmds []pushCmd, byOID map[string]ingest.PackObject, inStore func(oid string) bool) (bool, []string) {
 	seen := map[string]bool{}
 	var externals []string
 	var queue []string
@@ -290,11 +356,7 @@ func (h *Handler) connectivityOK(ctx context.Context, repo string, lazyDir func(
 		obj, inPack := byOID[oid]
 		if !inPack {
 			// Must already be present in the store; don't recurse into it.
-			dir, err := lazyDir()
-			if err != nil {
-				return false, nil
-			}
-			if _, _, err := h.Cache.ObjectInfo(repo, dir, oid); err != nil {
+			if !inStore(oid) {
 				return false, nil
 			}
 			externals = append(externals, oid)
@@ -410,6 +472,15 @@ func parsePktCommands(body []byte) (cmds []pushCmd, packOff int, sideband bool, 
 		}
 		payload := string(body[i+4 : i+n])
 		i += n
+		// A shallow client announces its boundary before the commands
+		// ("*shallow command-list"). Ignoring it is sound: connectivityOK
+		// proves every pushed object reaches the (never shallow) store.
+		if oid, isShallow := strings.CutPrefix(strings.TrimRight(payload, "\n"), "shallow "); isShallow {
+			if !first || len(oid) != 40 {
+				return nil, 0, false, false
+			}
+			continue
+		}
 		if first {
 			if nul := strings.IndexByte(payload, 0); nul >= 0 {
 				caps := payload[nul+1:]

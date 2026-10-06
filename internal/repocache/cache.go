@@ -6,6 +6,7 @@ package repocache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -90,6 +91,21 @@ type Cache struct {
 	syncedAt map[string]int64 // repoID -> RepoChangeToken it was last synced at
 
 	lastAccess sync.Map // repoID -> time.Time (per-process; dir mtime is the fallback)
+
+	// absentArtifacts remembers hydrate-only artifacts the store just said
+	// do not exist (repo+"\x00"+name -> time.Time). Hydrate probes them on
+	// every materialization, and a GET for a missing key costs ~200ms on
+	// Tigris - a never-maintained repo paid that on every push-driven sync.
+	absentArtifacts sync.Map
+}
+
+// absentArtifactTTL bounds how long a "not in the store" answer is reused.
+// Only hydrate-only artifacts qualify: their derive writes the file into
+// the local cache too, so a cached miss never hides one made on this node.
+const absentArtifactTTL = time.Minute
+
+func negativeCacheable(name string) bool {
+	return name == "meta/commit-graph" || strings.HasPrefix(name, "meta/history.")
 }
 
 func New(dir string, db repodb.DB, blobs blobstore.Store) *Cache {
@@ -447,10 +463,20 @@ func writeMidx(ctx context.Context, dir string, packCount int) {
 
 // FetchBlob downloads one store blob to dest atomically (tmp+rename).
 func (c *Cache) FetchBlob(ctx context.Context, repoID, name, dest string) error {
+	key := repoID + "\x00" + name
+	if negativeCacheable(name) {
+		if at, ok := c.absentArtifacts.Load(key); ok && time.Since(at.(time.Time)) < absentArtifactTTL {
+			return fmt.Errorf("%w: %s/%s (cached)", blobstore.ErrNotFound, repoID, name)
+		}
+	}
 	rc, err := c.Blobs.Get(ctx, repoID, name)
 	if err != nil {
+		if negativeCacheable(name) && errors.Is(err, blobstore.ErrNotFound) {
+			c.absentArtifacts.Store(key, time.Now())
+		}
 		return err
 	}
+	c.absentArtifacts.Delete(key)
 	defer rc.Close()
 	tmp, err := os.CreateTemp(filepath.Dir(dest), ".tmp-*")
 	if err != nil {

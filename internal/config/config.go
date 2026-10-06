@@ -43,6 +43,15 @@ type Config struct {
 	// hidden ops endpoint still work).
 	MaintainMinPacks int
 	MaintainInterval time.Duration
+	// MaintainMinInterval paces threshold-gated consolidation per repo: at
+	// least this long (or 4x the previous run's duration, if longer) between
+	// runs, so a continuously pushed repo can't keep maintenance - and the
+	// CPU - busy. 0 disables pacing. MaintainQuietAfter consolidates a repo
+	// that sits below MaintainMinPacks but has >= 2 packs once it has seen
+	// no new pack for this long (periodic worker only; 0 disables), so a
+	// repo that went quiet still converges to one gc pack.
+	MaintainMinInterval time.Duration
+	MaintainQuietAfter  time.Duration
 
 	// Per-subject request budgets (requests/second; 0 disables). Git ops
 	// are budgeted separately from REST calls - a clone costs more than a
@@ -128,8 +137,10 @@ func FromEnv() Config {
 
 		// New names, with fallback to the pre-rename env keys still set on
 		// deployed machines.
-		MaintainMinPacks: envInt("FORGE_MAINTAIN_MIN_PACKS", envInt("FORGE_COMPACT_MIN_PACKS", 10)),
-		MaintainInterval: envDuration("FORGE_MAINTAIN_INTERVAL", envDuration("FORGE_COMPACT_INTERVAL", time.Minute)),
+		MaintainMinPacks:    envInt("FORGE_MAINTAIN_MIN_PACKS", envInt("FORGE_COMPACT_MIN_PACKS", 64)),
+		MaintainInterval:    envDuration("FORGE_MAINTAIN_INTERVAL", envDuration("FORGE_COMPACT_INTERVAL", time.Minute)),
+		MaintainMinInterval: envDuration("FORGE_MAINTAIN_MIN_INTERVAL", time.Minute),
+		MaintainQuietAfter:  envDuration("FORGE_MAINTAIN_QUIET_AFTER", 5*time.Minute),
 
 		RateAPI: envFloat("FORGE_RATE_API", 50),
 		RateGit: envFloat("FORGE_RATE_GIT", 10),

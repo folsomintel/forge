@@ -1,6 +1,7 @@
 package githttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +36,11 @@ import (
 //     repo IS that pack - stream it straight from disk or the bucket,
 //     without materializing the repo or forking git.
 //
+//  3. SHALLOW CLONE (agent checkout): `clone --depth 1` wants a visible
+//     tip and nothing below it - the tip commit plus its tree closure,
+//     read through the cat-file pool and emitted as one full-object pack
+//     with a shallow-info section. Bounded; anything bigger goes to git.
+//
 // Soundness rule for (1): the client must end up with closure(W). Each
 // chain pack was connectivity-verified at receive against pack+store, so
 // the only risk is an object the SERVER had but the CLIENT does not (e.g.
@@ -50,27 +57,35 @@ const (
 	goFetchBFSCap = 768
 	// transitionCap bounds the in-memory transition window.
 	transitionCap = 8192
+	// goFetchShallowMaxObjects / goFetchShallowMaxBytes bound a depth-1
+	// clone served in Go (the whole response is built in memory).
+	goFetchShallowMaxObjects = 20000
+	goFetchShallowMaxBytes   = 8 << 20
 )
 
 // GoFetchStats mirrors GoReceiveStats for the fetch fast path.
 type GoFetchStats struct {
-	Eligible    int64            `json:"eligible"`
-	CloneStream int64            `json:"clone_stream"`
-	FellBack    int64            `json:"fell_back"`
-	FellBackBy  map[string]int64 `json:"fell_back_by,omitempty"`
+	Eligible     int64            `json:"eligible"`
+	CloneStream  int64            `json:"clone_stream"`
+	ShallowClone int64            `json:"shallow_clone"`
+	FellBack     int64            `json:"fell_back"`
+	FellBackBy   map[string]int64 `json:"fell_back_by,omitempty"`
 }
 
 type goFetchCounters struct {
-	eligible    atomic.Int64
-	cloneStream atomic.Int64
-	fellBack    atomic.Int64
+	eligible     atomic.Int64
+	cloneStream  atomic.Int64
+	shallowClone atomic.Int64
+	fellBack     atomic.Int64
 
-	fbArgs      atomic.Int64 // unsupported argument (filter/shallow/...)
-	fbCloneMiss atomic.Int64 // clone shape but repo not single-gc-pack-covered
-	fbChainMiss atomic.Int64 // wants don't resolve to haves in the window
-	fbLineage   atomic.Int64 // external object not provably client-reachable
-	fbPackRead  atomic.Int64 // stored pack unreadable
-	fbTags      atomic.Int64 // include-tag with tags present (incremental)
+	fbArgs        atomic.Int64 // unsupported argument (filter/deepen>1/...)
+	fbCloneMiss   atomic.Int64 // clone shape but repo not single-gc-pack-covered
+	fbChainMiss   atomic.Int64 // wants don't resolve to haves in the window
+	fbLineage     atomic.Int64 // external object not provably client-reachable
+	fbPackRead    atomic.Int64 // stored pack unreadable
+	fbTags        atomic.Int64 // include-tag with tags present
+	fbShallowMiss atomic.Int64 // depth-1 want not a visible tip, or object unreadable
+	fbShallowCap  atomic.Int64 // depth-1 closure over the object/byte bound
 }
 
 func (c *goFetchCounters) snapshot() GoFetchStats {
@@ -78,6 +93,7 @@ func (c *goFetchCounters) snapshot() GoFetchStats {
 	for name, v := range map[string]*atomic.Int64{
 		"args": &c.fbArgs, "clone_miss": &c.fbCloneMiss, "chain_miss": &c.fbChainMiss,
 		"lineage": &c.fbLineage, "pack_read": &c.fbPackRead, "tags": &c.fbTags,
+		"shallow_miss": &c.fbShallowMiss, "shallow_cap": &c.fbShallowCap,
 	} {
 		if n := v.Load(); n > 0 {
 			by[name] = n
@@ -85,7 +101,8 @@ func (c *goFetchCounters) snapshot() GoFetchStats {
 	}
 	return GoFetchStats{
 		Eligible: c.eligible.Load(), CloneStream: c.cloneStream.Load(),
-		FellBack: c.fellBack.Load(), FellBackBy: by,
+		ShallowClone: c.shallowClone.Load(),
+		FellBack:     c.fellBack.Load(), FellBackBy: by,
 	}
 }
 
@@ -148,10 +165,12 @@ type fetchArgs struct {
 	haves      map[string]bool
 	done       bool
 	includeTag bool
+	deepen     int // "deepen N"; 0 when absent
 }
 
 // parseFetchArgs returns ok=false for any argument the fast path does not
-// model (shallow, filter, want-ref, ...) - those requests belong to git.
+// model (client shallows, filter, want-ref, ...) - those requests belong
+// to git. "deepen N" is parsed; goFetch decides which depths it serves.
 func parseFetchArgs(lines []string) (fetchArgs, bool) {
 	fa := fetchArgs{haves: map[string]bool{}}
 	inArgs := false
@@ -188,8 +207,14 @@ func parseFetchArgs(lines []string) (fetchArgs, bool) {
 			return fa, false
 		case l == "include-tag":
 			fa.includeTag = true
+		case strings.HasPrefix(l, "deepen "):
+			n, err := strconv.Atoi(strings.TrimPrefix(l, "deepen "))
+			if err != nil || n < 1 {
+				return fa, false
+			}
+			fa.deepen = n
 		default:
-			return fa, false // shallow/deepen/filter/want-ref/sideband-all/...
+			return fa, false // shallow/deepen-*/filter/want-ref/sideband-all/...
 		}
 	}
 	return fa, len(fa.wants) > 0
@@ -211,6 +236,15 @@ func (h *Handler) goFetch(w http.ResponseWriter, r *http.Request, repo, ns strin
 	}
 	ctx := r.Context()
 
+	if fa.deepen > 0 {
+		// Only the fresh depth-1 clone is modelled: deeper histories, or a
+		// shallow repo deepening/fetching with haves, need git's boundary
+		// negotiation.
+		if fa.deepen != 1 || len(fa.haves) > 0 || !fa.done {
+			return fail(&h.goFetchCtr.fbArgs)
+		}
+		return h.goFetchShallow(ctx, w, repo, fa)
+	}
 	if len(fa.haves) == 0 {
 		if !fa.done {
 			return fail(&h.goFetchCtr.fbCloneMiss)
@@ -302,6 +336,131 @@ func (h *Handler) goFetchClone(ctx context.Context, w http.ResponseWriter, repo 
 	h.goFetchCtr.cloneStream.Add(1)
 	writeFetchResponse(w, nil, src)
 	return true
+}
+
+// --- shallow (depth 1) clone ---
+
+// goFetchShallow serves `deepen 1` with no haves: each want's commit plus
+// its full tree closure. Wants must be visible tips, so the walk never
+// reaches hidden objects; gitlinks are skipped (not our objects). A want
+// with parents becomes a shallow boundary the client records.
+func (h *Handler) goFetchShallow(ctx context.Context, w http.ResponseWriter, repo string, fa fetchArgs) bool {
+	fail := func(c *atomic.Int64) bool {
+		c.Add(1)
+		h.goFetchCtr.fellBack.Add(1)
+		return false
+	}
+	refs, err := h.DB.ListRefs(ctx, repo)
+	if err != nil {
+		return fail(&h.goFetchCtr.fbShallowMiss)
+	}
+	tips := make(map[string]bool, len(refs))
+	hasTags := false
+	for _, ref := range refs {
+		if strings.HasPrefix(ref.Name, "refs/namespaces/") {
+			continue
+		}
+		tips[ref.Target] = true
+		if strings.HasPrefix(ref.Name, "refs/tags/") {
+			hasTags = true
+		}
+	}
+	for _, want := range fa.wants {
+		if !tips[want] {
+			return fail(&h.goFetchCtr.fbShallowMiss)
+		}
+	}
+	// include-tag would need annotated tags pointing at the wants; git
+	// decides those.
+	if fa.includeTag && hasTags {
+		return fail(&h.goFetchCtr.fbTags)
+	}
+	dir, err := h.Cache.MaterializeServe(ctx, repo)
+	if err != nil {
+		return fail(&h.goFetchCtr.fbShallowMiss)
+	}
+
+	type item struct{ typ, oid string }
+	var (
+		queue   []item
+		objs    []ingest.PackObject
+		shallow []string
+		total   int
+	)
+	seen := map[string]bool{}
+	for _, want := range fa.wants {
+		if !seen[want] {
+			seen[want] = true
+			queue = append(queue, item{"commit", want})
+		}
+	}
+	for len(queue) > 0 {
+		it := queue[0]
+		queue = queue[1:]
+		data, err := h.Cache.BlobContents(repo, dir, it.oid)
+		if err != nil {
+			return fail(&h.goFetchCtr.fbShallowMiss)
+		}
+		total += len(data)
+		if len(objs) >= goFetchShallowMaxObjects || total > goFetchShallowMaxBytes {
+			return fail(&h.goFetchCtr.fbShallowCap)
+		}
+		objs = append(objs, ingest.PackObject{Type: it.typ, OID: it.oid, Data: data})
+		switch it.typ {
+		case "commit":
+			tree, hasParent, ok := commitTreeAndParent(data)
+			if !ok {
+				return fail(&h.goFetchCtr.fbShallowMiss)
+			}
+			if hasParent {
+				shallow = append(shallow, it.oid)
+			}
+			if !seen[tree] {
+				seen[tree] = true
+				queue = append(queue, item{"tree", tree})
+			}
+		case "tree":
+			for _, e := range treeEntries(data) {
+				if e.mode == "160000" || seen[e.oid] {
+					continue // gitlink: a commit in another repo
+				}
+				seen[e.oid] = true
+				typ := "blob"
+				if e.mode == "40000" {
+					typ = "tree"
+				}
+				queue = append(queue, item{typ, e.oid})
+			}
+		}
+	}
+
+	var info []string
+	if len(shallow) > 0 {
+		info = append(info, "shallow-info\n")
+		for _, oid := range shallow {
+			info = append(info, "shallow "+oid+"\n")
+		}
+	}
+	h.goFetchCtr.eligible.Add(1)
+	h.goFetchCtr.shallowClone.Add(1)
+	writeFetchResponse(w, info, bytes.NewReader(ingest.WritePack(objs)))
+	return true
+}
+
+// commitTreeAndParent reads a raw commit's header: its root tree and
+// whether it has any parent.
+func commitTreeAndParent(data []byte) (tree string, hasParent bool, ok bool) {
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if line == "" {
+			break
+		}
+		if t, found := strings.CutPrefix(line, "tree "); found {
+			tree = strings.TrimSpace(t)
+		} else if strings.HasPrefix(line, "parent ") {
+			hasParent = true
+		}
+	}
+	return tree, hasParent, len(tree) == 40
 }
 
 // --- incremental chain ---
@@ -494,18 +653,25 @@ func (h *Handler) proveInClientClosure(ctx context.Context, repo string, termina
 // treeEntryOIDs parses raw tree bytes: "<mode> <name>\x00<20-byte oid>"*.
 func treeEntryOIDs(data []byte) []string {
 	var out []string
+	for _, e := range treeEntries(data) {
+		out = append(out, e.oid)
+	}
+	return out
+}
+
+type treeEntry struct{ mode, oid string }
+
+// treeEntries parses raw tree bytes into (mode, oid) pairs; a truncated
+// tail is dropped.
+func treeEntries(data []byte) []treeEntry {
+	var out []treeEntry
 	for len(data) > 0 {
-		nul := -1
-		for i, b := range data {
-			if b == 0 {
-				nul = i
-				break
-			}
-		}
+		nul := bytes.IndexByte(data, 0)
 		if nul < 0 || nul+21 > len(data) {
 			return out
 		}
-		out = append(out, hex.EncodeToString(data[nul+1:nul+21]))
+		mode, _, _ := bytes.Cut(data[:nul], []byte(" "))
+		out = append(out, treeEntry{mode: string(mode), oid: hex.EncodeToString(data[nul+1 : nul+21])})
 		data = data[nul+21:]
 	}
 	return out
@@ -556,9 +722,9 @@ func ackLines(terminals map[string]bool, done bool) []string {
 	return lines
 }
 
-// writeFetchResponse emits the v2 fetch sections: optional
-// acknowledgments (ending ready), then the packfile section with the pack
-// bytes multiplexed on sideband channel 1.
+// writeFetchResponse emits the v2 fetch sections: an optional leading
+// section (acknowledgments ending ready, or shallow-info), then the
+// packfile section with the pack bytes multiplexed on sideband channel 1.
 func writeFetchResponse(w http.ResponseWriter, ack []string, pack io.Reader) {
 	w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 	w.Header().Set("Cache-Control", "no-cache")

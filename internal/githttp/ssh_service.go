@@ -57,7 +57,9 @@ func (h *Handler) RunGitSSH(ctx context.Context, service, repoArg, pusher string
 	if err != nil {
 		return fmt.Errorf("repository not found")
 	}
-	lock.RLock()
+	if !rlockCtx(ctx, lock) {
+		return errors.New("server busy - retry")
+	}
 	defer lock.RUnlock()
 
 	bin := strings.TrimPrefix(service, "git-") // upload-pack | receive-pack

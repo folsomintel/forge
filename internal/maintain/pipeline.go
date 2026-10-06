@@ -37,6 +37,9 @@ const orphanGrace = time.Hour
 // monorepo-sized repo runs ~12 minutes, so leave generous headroom.
 const nudgeTimeout = time.Hour
 
+// deleteParallelism bounds concurrent store DELETEs of superseded blobs.
+const deleteParallelism = 8
+
 type Pipeline struct {
 	Cache *repocache.Cache
 	DB    repodb.DB
@@ -50,6 +53,12 @@ type Pipeline struct {
 	// MinPacks is the pack-count threshold for worker scans and push nudges.
 	MinPacks int
 
+	// MinInterval paces threshold-gated runs per repo (see pace.go); 0
+	// disables pacing. QuietAfter lets the worker consolidate a repo below
+	// MinPacks once it has been push-quiet that long; 0 disables.
+	MinInterval time.Duration
+	QuietAfter  time.Duration
+
 	// BuildHistory publishes a blobless commits+trees "history pack" each
 	// maintenance run, for remote-placement replicas to serve history locally
 	// (walgit Phase 3). Off by default; enable on instances whose replicas use
@@ -57,6 +66,11 @@ type Pipeline struct {
 	BuildHistory bool
 
 	inflight sync.Map // repoID -> struct{}: single-flight for async runs
+	pace     sync.Map // repoID -> *repoPace
+
+	// afterBuild, when set (tests only), runs between the unlocked build
+	// and the swap - the window in which concurrent pushes move refs.
+	afterBuild func()
 }
 
 type Report struct {
@@ -68,7 +82,8 @@ type Report struct {
 }
 
 // Run executes the pipeline for one repo. minPacks <= 1 forces consolidation
-// regardless of pack count; larger values make it threshold-gated.
+// regardless of pack count; larger values make it threshold-gated and
+// subject to per-repo pacing (a paced call is a no-op).
 func (p *Pipeline) Run(ctx context.Context, repoID string, minPacks int) (*Report, error) {
 	// Single-flight per repo: two concurrent runs would build duplicate
 	// packs, and it is also what makes the lock-free build window below
@@ -78,26 +93,36 @@ func (p *Pipeline) Run(ctx context.Context, repoID string, minPacks int) (*Repor
 	if _, busy := p.inflight.LoadOrStore(repoID, struct{}{}); busy {
 		return &Report{}, nil
 	}
-	defer p.inflight.Delete(repoID)
-
-	lock := p.Cache.Lock(repoID)
-	lock.Lock()
-	held := true
 	defer func() {
-		if held {
-			lock.Unlock()
+		p.inflight.Delete(repoID)
+		// Pushes that landed during this run had their nudges dropped
+		// (single-flight); re-evaluate once for them, or their packs would
+		// wait for the next push or worker tick.
+		if p.takePending(repoID) {
+			p.NudgeIfNeeded(context.Background(), repoID)
 		}
 	}()
+	if minPacks > 1 && p.paced(repoID) {
+		return &Report{}, nil
+	}
+	start := time.Now()
+	res, err := p.run(ctx, repoID, minPacks)
+	p.ran(repoID, start, err)
+	return res, err
+}
 
-	dir, err := p.Cache.Materialize(ctx, repoID)
-	if err != nil {
-		return nil, err
-	}
-	packs, err := p.DB.ListPacks(ctx, repoID)
-	if err != nil {
-		return nil, err
-	}
-	refs, err := p.DB.ListRefs(ctx, repoID)
+func (p *Pipeline) run(ctx context.Context, repoID string, minPacks int) (*Report, error) {
+	// The write lock is held only to snapshot and materialize: it waits out
+	// in-flight git-path pushes (they hold the read lock), so the snapshot
+	// includes them. Packs, then refs: a push records its pack before moving
+	// a ref, so a snapshot ref whose pack missed the pack snapshot points
+	// into a post-snapshot pack, which the swap keeps. Materialize runs
+	// AFTER the snapshot so everything the snapshot refs reach is local for
+	// the build.
+	lock := p.Cache.Lock(repoID)
+	lock.Lock()
+	packs, refs, dir, err := p.snapshot(ctx, repoID)
+	lock.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -118,20 +143,31 @@ func (p *Pipeline) Run(ctx context.Context, repoID string, minPacks int) (*Repor
 		// pushes) are not blocked behind a big repack. Packs are immutable
 		// and only added concurrently, so the snapshot closure stays fully
 		// readable throughout; only the atomic pack-list swap needs the lock.
-		lock.Unlock()
-		held = false
-		built, berr := p.buildConsolidated(ctx, st, res)
-		lock.Lock()
-		held = true
-		if berr != nil {
-			return nil, berr
+		built, err := p.buildConsolidated(ctx, st, res)
+		if err != nil {
+			return nil, err
 		}
 		if built != nil {
-			if err := p.swapConsolidated(ctx, st, packs, built, res); err != nil {
+			defer os.RemoveAll(built.qdir)
+			if p.afterBuild != nil {
+				p.afterBuild()
+			}
+			superseded, ok, err := p.swapConsolidated(ctx, st, packs, built, res)
+			if err != nil {
 				return nil, err
 			}
-			res.After = 1
-			res.Artifacts = p.deriveAll(ctx, st)
+			if ok {
+				// gc pack + whatever pushes added since the snapshot.
+				if after, err := p.DB.ListPacks(ctx, repoID); err == nil {
+					res.After = len(after)
+				}
+				// Everything below runs unlocked. Superseded blobs are out of
+				// the pack list, so nothing new will fetch them; derive reads
+				// only the gc pack (closure(st.Refs)) and advertise/sweep only
+				// write atomically-renamed files or store blobs.
+				p.deleteSuperseded(ctx, repoID, superseded)
+				res.Artifacts = p.deriveAll(ctx, st)
+			}
 		}
 	}
 
@@ -145,6 +181,21 @@ func (p *Pipeline) Run(ctx context.Context, repoID string, minPacks int) (*Repor
 	return res, nil
 }
 
+// snapshot reads the pack list and refs, then materializes. Caller holds
+// the repo write lock.
+func (p *Pipeline) snapshot(ctx context.Context, repoID string) ([]repodb.Pack, []repodb.Ref, string, error) {
+	packs, err := p.DB.ListPacks(ctx, repoID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	refs, err := p.DB.ListRefs(ctx, repoID)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	dir, err := p.Cache.Materialize(ctx, repoID)
+	return packs, refs, dir, err
+}
+
 // Nudge forces one asynchronous maintenance run for the repo (single-flight;
 // a duplicate nudge while one is running is dropped). Used after imports and
 // wherever a repo should become optimally readable right now.
@@ -153,14 +204,20 @@ func (p *Pipeline) Nudge(repoID string) {
 }
 
 // NudgeIfNeeded checks the pack count and, if it crossed the threshold,
-// kicks an asynchronous threshold-gated run. Cheap enough to call after
-// every push; the periodic worker remains the safety net.
+// kicks an asynchronous threshold-gated run. Called after every push, so it
+// consults the pacing window and a cached per-repo pack estimate first and
+// lists packs only when a run could actually start; the periodic worker
+// remains the safety net.
 func (p *Pipeline) NudgeIfNeeded(ctx context.Context, repoID string) {
-	if p.MinPacks <= 0 {
+	if p.MinPacks <= 0 || !p.mayNeed(repoID) {
 		return
 	}
 	packs, err := p.DB.ListPacks(ctx, repoID)
-	if err != nil || len(packs) < p.MinPacks {
+	if err != nil {
+		return
+	}
+	p.observed(repoID, len(packs))
+	if len(packs) < p.MinPacks {
 		return
 	}
 	p.runAsync(repoID, p.MinPacks)
@@ -254,78 +311,120 @@ func (p *Pipeline) buildConsolidated(ctx context.Context, st *RepoState, res *Re
 	return &builtPack{qdir: qdir, name: name, hash: hash, exts: exts}, nil
 }
 
-// swapConsolidated installs the built pack as the repo's sole pack: swap the
-// pack list, move the blobs into the cache, then delete the superseded ones.
-// Caller holds the repo lock. Concurrent pushes only ADD packs, so every
-// pack in oldPacks still exists and none of the new push's packs are removed.
-func (p *Pipeline) swapConsolidated(ctx context.Context, st *RepoState, oldPacks []repodb.Pack, built *builtPack, res *Report) error {
-	defer os.RemoveAll(built.qdir)
+// swapConsolidated installs the built pack in place of the snapshot's packs:
+// prove every current ref stays covered, swap the pack list, move the blobs
+// into the cache. Only the swap itself holds the repo write lock; deleting
+// the superseded blobs (returned: the removed packs whose blobs this repo
+// owns) is the caller's job, after the lock is released. ok=false with no
+// error means the swap was skipped; the next cycle retries.
+//
+// Concurrent pushes only ADD packs, so every pack in oldPacks still exists
+// and packs added after the snapshot are never removed: after the swap the
+// pack list is gc + post-snapshot packs. The gc pack holds closure(st.Refs);
+// a ref that moved since (a force-push, an ephemeral PR head) may reach
+// objects outside it, which is safe only if they are in the post-snapshot
+// packs - otherwise deleting oldNames would strand them (repo corruption).
+// coverage (coverage.go) proves that before anything is committed.
+func (p *Pipeline) swapConsolidated(ctx context.Context, st *RepoState, oldPacks []repodb.Pack, built *builtPack, res *Report) (superseded []string, ok bool, err error) {
 	name, hash, exts := built.name, built.hash, built.exts
 
-	// The gc pack contains closure(st.Refs) as snapshotted before the
-	// unlocked build. If a ref moved since (a force-push resurrecting an old
-	// commit, an ephemeral PR head) it may now reach an object that lives
-	// ONLY in a pack we're about to delete and is NOT in the gc pack -
-	// deleting oldNames would then strand it (repo corruption). Bail unless
-	// the ref set is byte-identical to the snapshot; the next cycle retries.
-	// Also re-check existence: DELETE /repos ran during the unlocked window.
+	// Re-check existence: DELETE /repos ran during the unlocked window.
 	if _, err := p.DB.GetRepo(ctx, st.RepoID); err != nil {
-		return nil // repo deleted mid-build; drop the built pack (swept later)
-	}
-	cur, err := p.DB.ListRefs(ctx, st.RepoID)
-	if err != nil {
-		return err
-	}
-	if !sameRefs(cur, st.Refs) {
-		slog.Info("consolidate: refs moved during build, retrying next cycle", "repo", st.RepoID)
-		return nil
+		return nil, false, nil // repo deleted mid-build; drop the built pack (swept later)
 	}
 
 	// Never delete a name we just (re)inserted.
+	old := map[string]bool{}
 	oldNames := []string{}
 	ownedOld := []string{}
 	for _, op := range oldPacks {
 		if op.Name == name {
 			continue
 		}
+		old[op.Name] = true
 		oldNames = append(oldNames, op.Name)
 		if op.BlobRepo == "" {
 			ownedOld = append(ownedOld, op.Name) // shared fork blobs stay with their owner
 		}
 	}
-	if err := p.DB.ReplacePacks(ctx, st.RepoID, oldNames, []repodb.Pack{{Name: name, SizeBytes: res.NewSize, Source: "gc"}}); err != nil {
-		return err
+
+	cov, err := p.newCoverage(st, built, old)
+	if err != nil {
+		return nil, false, err
+	}
+	defer cov.close()
+	// The bulk of the proof (refs that moved during the build) runs
+	// unlocked; under the lock only refs that moved again since need it.
+	if err := cov.check(ctx); err != nil {
+		slog.Info("consolidate: moved ref not covered, retrying next cycle", "repo", st.RepoID, "err", err)
+		return nil, false, nil
 	}
 
-	// Update the cache, then delete superseded blobs (post-commit only).
+	lock := p.Cache.Lock(st.RepoID)
+	lock.Lock()
+	locked := time.Now()
+	defer func() {
+		lock.Unlock()
+		slog.Info("consolidate: swap", "repo", st.RepoID, "lock_held", time.Since(locked),
+			"swapped", ok, "superseded", len(oldNames))
+	}()
+	// The write lock excludes git-path pushes and materializations, but
+	// goreceive pushes stay lock-free: re-prove against the refs as of now.
+	if err := cov.check(ctx); err != nil {
+		slog.Info("consolidate: moved ref not covered, retrying next cycle", "repo", st.RepoID, "err", err)
+		return nil, false, nil
+	}
+	if err := p.DB.ReplacePacks(ctx, st.RepoID, oldNames, []repodb.Pack{{Name: name, SizeBytes: res.NewSize, Source: "gc"}}); err != nil {
+		return nil, false, err
+	}
+
+	// Update the cache (post-commit only). The multi-pack-index covers the
+	// superseded packs; drop it rather than leave lookups probing them.
 	packDir := filepath.Join(st.Dir, "objects", "pack")
 	for _, ext := range exts {
 		if err := os.Rename(filepath.Join(built.qdir, "pack-"+hash+ext), filepath.Join(packDir, name+ext)); err != nil && ext != ".bitmap" {
-			return err
+			return nil, false, err
 		}
 	}
-	for _, old := range oldNames {
+	for _, o := range oldNames {
 		for _, ext := range exts {
-			os.Remove(filepath.Join(packDir, old+ext))
+			os.Remove(filepath.Join(packDir, o+ext))
 		}
 	}
-	for _, old := range ownedOld {
-		// A zero-copy fork may still reference this blob (blob_repo=us);
-		// deleting it would orphan the fork. Leave shared blobs for the fork
-		// to inherit until it consolidates onto its own prefix.
-		if ref, err := p.DB.BlobReferenced(ctx, st.RepoID, old); err != nil {
-			slog.Error("blob dependents check", "repo", st.RepoID, "pack", old, "err", err)
-			continue
-		} else if ref {
-			continue
-		}
-		for _, ext := range exts {
-			if err := p.Blobs.Delete(ctx, st.RepoID, old+ext); err != nil {
-				slog.Error("delete superseded pack", "repo", st.RepoID, "pack", old, "err", err)
+	os.Remove(filepath.Join(packDir, "multi-pack-index"))
+	return ownedOld, true, nil
+}
+
+// deleteSuperseded deletes the store blobs of packs a committed swap took
+// out of the pack list - bounded-parallel and without the repo lock. The
+// local copies are already gone and nothing new resolves these names, so
+// this is pure garbage collection; a failed delete is logged and left for
+// sweepOrphans.
+func (p *Pipeline) deleteSuperseded(ctx context.Context, repoID string, names []string) {
+	sem := make(chan struct{}, deleteParallelism)
+	var wg sync.WaitGroup
+	for _, old := range names {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(old string) {
+			defer func() { <-sem; wg.Done() }()
+			// A zero-copy fork may still reference this blob (blob_repo=us);
+			// deleting it would orphan the fork. Leave shared blobs for the
+			// fork to inherit until it consolidates onto its own prefix.
+			if ref, err := p.DB.BlobReferenced(ctx, repoID, old); err != nil {
+				slog.Error("blob dependents check", "repo", repoID, "pack", old, "err", err)
+				return
+			} else if ref {
+				return
 			}
-		}
+			for _, ext := range []string{".pack", ".idx", ".bitmap"} {
+				if err := p.Blobs.Delete(ctx, repoID, old+ext); err != nil {
+					slog.Error("delete superseded pack", "repo", repoID, "pack", old, "err", err)
+				}
+			}
+		}(old)
 	}
-	return nil
+	wg.Wait()
 }
 
 // sweepOrphans deletes store pack blobs that are not in the pack list and
@@ -383,9 +482,10 @@ func (p *Pipeline) sweepOrphans(ctx context.Context, repoID string) (int, error)
 }
 
 // Worker is the periodic maintainer: scans for repos whose pack count
-// crossed the threshold and runs the pipeline for each.
+// crossed the threshold - or that went quiet with more than one pack - and
+// runs the pipeline for each (paced repos are skipped until their window
+// passes).
 func (p *Pipeline) Worker(ctx context.Context, interval time.Duration) {
-	minPacks := max(p.MinPacks, 2)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -393,39 +493,54 @@ func (p *Pipeline) Worker(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			repos, err := p.DB.ReposNeedingCompaction(ctx, minPacks)
-			if err != nil {
-				slog.Error("maintenance scan", "err", err)
-				continue
-			}
-			for _, repo := range repos {
-				res, err := p.Run(ctx, repo, minPacks)
-				if err != nil {
-					slog.Error("maintain", "repo", repo, "err", err)
-					continue
-				}
-				slog.Info("maintained", "repo", repo, "before", res.Before, "after", res.After,
-					"artifacts", res.Artifacts, "swept", res.Swept)
-			}
+			p.scan(ctx)
 		}
 	}
 }
 
-// sameRefs reports whether two ref lists are identical as name->target
-// maps (order-independent). Used to abort a consolidation whose gc pack was
-// built from a now-stale ref snapshot.
-func sameRefs(a, b []repodb.Ref) bool {
-	if len(a) != len(b) {
-		return false
+// scan is one worker tick.
+func (p *Pipeline) scan(ctx context.Context) {
+	minPacks := max(p.MinPacks, 2)
+	repos, err := p.DB.ReposNeedingCompaction(ctx, minPacks)
+	if err != nil {
+		slog.Error("maintenance scan", "err", err)
+		return
 	}
-	m := make(map[string]string, len(a))
-	for _, r := range a {
-		m[r.Name] = r.Target
+	due := map[string]int{}
+	for _, repo := range repos {
+		due[repo] = minPacks
 	}
-	for _, r := range b {
-		if m[r.Name] != r.Target {
-			return false
+	// Quiet pass: a repo below the threshold that has stopped receiving
+	// packs still converges to a single gc pack (clone passthrough needs
+	// one), once per quiet spell.
+	if p.QuietAfter > 0 && minPacks > 2 {
+		multi, err := p.DB.ReposNeedingCompaction(ctx, 2)
+		if err != nil {
+			slog.Error("maintenance scan", "err", err)
+		}
+		for _, repo := range multi {
+			if _, ok := due[repo]; ok || p.paced(repo) {
+				continue
+			}
+			packs, err := p.DB.ListPacks(ctx, repo)
+			if err != nil || len(packs) < 2 {
+				continue
+			}
+			if p.quiet(repo, packs) {
+				due[repo] = 2
+			}
 		}
 	}
-	return true
+	for repo, threshold := range due {
+		if p.paced(repo) {
+			continue
+		}
+		res, err := p.Run(ctx, repo, threshold)
+		if err != nil {
+			slog.Error("maintain", "repo", repo, "err", err)
+			continue
+		}
+		slog.Info("maintained", "repo", repo, "before", res.Before, "after", res.After,
+			"artifacts", res.Artifacts, "swept", res.Swept)
+	}
 }
