@@ -66,13 +66,30 @@ for each request and to read packs directly from the bucket.
   the repository into the local cache.
 - Pushes use a Go packfile parser that resolves deltas and thin packs.
 - Fetches assemble incremental packs from previous pushes. Full clones can
-  stream packs directly from the bucket.
+  stream packs directly from the bucket, and depth-1 clones are built from
+  the tip's tree without starting Git.
 - Object reads use Go tree and commit parsers with a pool of `git cat-file`
   processes. On replicas, a pack reader can fetch blocks from the bucket and
   resolve objects, including deltas, without downloading entire packs to disk.
 
 Git still handles pack generation and repacking. Requests the Go paths cannot
 handle fall back to Git.
+
+## Performance
+
+Measured with [ForgeMark](https://github.com/entireio/forgemark): 32
+concurrent agents on one repo, each commit 1–3 files of 1KB, load generator
+in Fly `sjc` (2026-10-05). Forge and walgit each ran on one Fly
+performance-4x (4 CPU, 8GB) over Tigris. Cursor Origin is the hosted service;
+its hardware and region are unknown, so its latency includes network time.
+
+| 32 agents | push | shallow clone | clone + 5 pushes |
+|---|---|---|---|
+| **forge** | **160/s**, p50 185ms | **517/s**, p50 59ms | **136/s**, p50 180ms |
+| Cursor Origin | 75/s, p50 412ms | 123/s, p50 253ms | 64/s, p50 355ms |
+| walgit | 11/s, p50 2.6s | 22/s, p50 1.3s | 3.8/s, p50 6.7s |
+
+At 128 agents forge sustained 375 pushes/s (p50 326ms) with no errors.
 
 ## Configuration
 
